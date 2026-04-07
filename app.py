@@ -182,9 +182,10 @@ def list_meetings_from_ftp(wg):
 
 def resolve_meeting_folder(wg, meeting_num):
     """
-    사용자가 입력한 회의 번호(예: 168)로 FTP에서 실제 폴더명을 찾는다.
-    RAN 그룹: TSGR2_133bis (번호만 — 바로 매칭)
-    SA/CT 그룹: TSGS2_168_Goteborg_2025-04 (도시명+날짜 포함 — 디렉토리에서 검색 필요)
+    사용자가 입력한 회의 번호(예: 168, 131bis)로 FTP에서 실제 폴더명을 찾는다.
+    RAN 그룹: TSGR2_133bis (번호+bis 그대로)
+    RAN3: TSGR3_131-bis (하이픈 변형도 있음)
+    SA/CT 그룹: TSGS2_168_Goteborg_2025-04 (도시명+날짜 포함)
 
     반환: 실제 폴더명 문자열, 못 찾으면 None
     """
@@ -193,17 +194,25 @@ def resolve_meeting_folder(wg, meeting_num):
     if not prefixes:
         return None
 
-    # 후보 폴더명 구성
-    simple_folder = f"{prefixes[0]}{meeting_num}"
+    # 후보 폴더명 여러 변형 생성 (bis, -bis, BIS 등)
+    base = f"{prefixes[0]}{meeting_num}"
+    candidates_to_try = [base]
+    # bis/e 변형: 131bis → 131-bis, 131_bis
+    if re.search(r'\d(bis|e)\b', meeting_num, re.I):
+        num_part = re.match(r'(\d+)', meeting_num).group(1)
+        suffix = meeting_num[len(num_part):]
+        candidates_to_try.append(f"{prefixes[0]}{num_part}-{suffix}")
+        candidates_to_try.append(f"{prefixes[0]}{num_part}_{suffix}")
 
-    # 시도 1: 단순 이름으로 바로 접근 (RAN 그룹은 대부분 이것으로 됨)
-    test_url = f"https://www.3gpp.org/ftp/{ftp_path}/{simple_folder}/Docs/"
-    try:
-        r = requests.head(test_url, timeout=10, verify=False, allow_redirects=True)
-        if r.status_code == 200:
-            return simple_folder
-    except Exception:
-        pass
+    # 시도 1: 단순 이름 변형들로 바로 접근
+    for candidate in candidates_to_try:
+        test_url = f"https://www.3gpp.org/ftp/{ftp_path}/{candidate}/Docs/"
+        try:
+            r = requests.head(test_url, timeout=10, verify=False, allow_redirects=True)
+            if r.status_code == 200:
+                return candidate
+        except Exception:
+            pass
 
     # 시도 2: FTP 디렉토리 리스팅에서 매칭되는 폴더 찾기
     dir_url = f"https://www.3gpp.org/ftp/{ftp_path}/"
@@ -216,23 +225,47 @@ def resolve_meeting_folder(wg, meeting_num):
         all_links = re.findall(r'href="([^"?]+)"', r.text)
         all_links += re.findall(r'>([A-Z][^<]{3,80})<', r.text)
 
-        candidates = []
-        search_pattern = f"{prefixes[0]}{meeting_num}".upper()
+        # 숫자 부분만 추출해서 매칭 (131bis, 131-bis, 131_bis 모두 → "131" + "bis")
+        num_match = re.match(r'(\d+)', meeting_num)
+        if not num_match:
+            return None
+        num_part = num_match.group(1)
+        suffix_part = meeting_num[len(num_part):].lower()  # "bis", "e", "" 등
 
+        found = []
         for link in all_links:
             name = link.rstrip("/").split("/")[-1].strip()
             if not name:
                 continue
             name_upper = name.upper()
-            if name_upper.startswith(search_pattern):
-                rest = name_upper[len(search_pattern):]
-                if rest == "" or rest.startswith("_") or rest.startswith("/"):
-                    candidates.append(name)
+            prefix_upper = prefixes[0].upper()
+            if not name_upper.startswith(prefix_upper):
+                continue
+            # prefix 뒤의 부분에서 숫자 추출
+            after_prefix = name[len(prefixes[0]):]
+            folder_num_match = re.match(r'(\d+)', after_prefix)
+            if not folder_num_match:
+                continue
+            folder_num = folder_num_match.group(1)
+            if folder_num != num_part:
+                continue
+            # 숫자 뒤 부분 체크 (bis, -bis, _bis, BIS 등)
+            folder_rest = after_prefix[len(folder_num):].lower()
+            if suffix_part:
+                # suffix가 있으면 (bis, e 등) 그것과 매칭
+                # 131bis → "bis", 131-bis → "-bis", 131_bis → "_bis"
+                clean_rest = folder_rest.lstrip("-_")
+                if clean_rest.startswith(suffix_part):
+                    found.append(name)
+            else:
+                # suffix 없으면 (순수 숫자) 정확히 숫자만 매칭
+                if folder_rest == "" or folder_rest.startswith("_") or folder_rest.startswith("/"):
+                    found.append(name)
 
-        if candidates:
-            candidates.sort(key=len)
-            append_log(f"폴더 후보: {candidates}")
-            return candidates[0]
+        if found:
+            found.sort(key=len)
+            append_log(f"폴더 후보: {found}")
+            return found[0]
 
     except Exception as e:
         append_log(f"폴더 검색 오류: {e}")
@@ -440,7 +473,51 @@ def _download_doc(entry, td_name, headers):
 # ==========================================
 # 4. Output 1 — extract_all_conclusions (원본 동일)
 # ==========================================
+def _cleanup_tmp_if_low_disk():
+    """
+    디스크 잔여 용량이 전체의 10% 미만이면 /tmp 안의 이전 다운로드 잔류물을 정리.
+    Cloud Function은 자동 정리되지만, Streamlit 서버에서 직접 처리 시
+    비정상 종료 등으로 /tmp에 파일이 남을 수 있음.
+    """
+    import shutil
+    try:
+        tmp_dir = tempfile.gettempdir()
+        disk = shutil.disk_usage(tmp_dir)
+        free_pct = disk.free / disk.total * 100
+
+        if free_pct < 10:
+            append_log(f"⚠️ 디스크 여유 공간 부족 ({free_pct:.1f}%). /tmp 정리 시작...")
+            cleaned = 0
+            for item in os.listdir(tmp_dir):
+                item_path = os.path.join(tmp_dir, item)
+                # 3GPP 관련 임시 파일/폴더만 삭제 (안전)
+                if any(kw in item.lower() for kw in ["tmp", "r1-", "r2-", "r3-", "r4-",
+                                                       "s1-", "s2-", "s3-", "c1-", "c3-",
+                                                       "3gpp", "docm_unzip", "repack"]):
+                    try:
+                        if os.path.isdir(item_path):
+                            shutil.rmtree(item_path, ignore_errors=True)
+                        else:
+                            os.remove(item_path)
+                        cleaned += 1
+                    except Exception:
+                        pass
+            append_log(f"정리 완료: {cleaned}개 항목 삭제.")
+            try:
+                disk2 = shutil.disk_usage(tmp_dir)
+                append_log(f"여유 공간: {free_pct:.1f}% → {disk2.free / disk2.total * 100:.1f}%")
+            except Exception:
+                pass
+        else:
+            append_log(f"디스크 여유: {free_pct:.1f}% (정리 불필요)")
+    except Exception as e:
+        append_log(f"디스크 체크 오류 (무시): {e}")
+
+
 def extract_all_conclusions(entries, status_elem, progress_elem, log_func):
+    # 분석 시작 전 디스크 용량 체크 및 정리
+    _cleanup_tmp_if_low_disk()
+
     if CLOUD_FUNCTION_URL:
         return _extract_via_cloud(entries, status_elem, progress_elem, log_func)
     return _extract_local(entries, status_elem, progress_elem, log_func)
