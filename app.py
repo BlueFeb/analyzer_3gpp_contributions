@@ -1251,10 +1251,12 @@ elif page == "🚀 통합 분석기":
             agenda_items = sorted(st.session_state.agenda_dict.keys())
             st.success(f"✅ {len(agenda_items)}개 agenda, 총 {len(st.session_state.all_entries)}개 문서 발견")
 
+            st.markdown("#### 👇 분석할 Agenda를 선택하세요")
             selected_agenda = st.selectbox(
                 "Agenda 선택:",
                 agenda_items,
                 format_func=lambda x: f"{x} ({len(st.session_state.agenda_dict[x])}개 문서)",
+                label_visibility="collapsed",
             )
 
             if selected_agenda:
@@ -1364,11 +1366,27 @@ elif page == "🚀 통합 분석기":
                 help="서버 기본 키의 일일 한도가 초과된 경우, 개인 무료 API 키를 입력하여 사용할 수 있습니다."
             )
             if "개인" in key_mode:
+                with st.expander("📖 개인 API 키 발급 방법 (1분이면 끝! 완전 무료)", expanded=True):
+                    st.markdown("""
+**컴퓨터 초보도 따라할 수 있는 3단계 가이드:**
+
+**1단계:** 아래 링크를 클릭하세요 (구글 로그인 필요):
+👉 **[Google AI Studio - API 키 발급 페이지](https://aistudio.google.com/app/apikey)**
+
+**2단계:** 화면에서 파란색 **'Create API key'** 버튼을 클릭하세요.
+→ 팝업이 뜨면 **'Create API key in new project'** 를 클릭하세요.
+→ ⚠️ **반드시 'in new project'를 선택하세요!** 이렇게 하면 과금이 절대 되지 않습니다.
+
+**3단계:** `AIzaSy...` 로 시작하는 긴 문자가 생성됩니다.
+→ 이 문자를 **복사(Ctrl+C)**하여 아래 입력창에 **붙여넣기(Ctrl+V)**하세요.
+
+✅ **완전 무료**입니다. 카드 등록이 필요 없고, 하루 1,500회까지 무료로 사용 가능합니다.
+                    """)
+
                 personal_key = st.text_input(
                     "개인 Gemini API Key 입력:",
                     type="password",
                     placeholder="AIzaSy...",
-                    help="Google AI Studio(aistudio.google.com/app/apikey)에서 무료 발급. 결제 없는 프로젝트에서 만들면 과금 걱정 없습니다."
                 )
                 if personal_key and personal_key.strip():
                     api_key_to_use = personal_key.strip()
@@ -1378,17 +1396,34 @@ elif page == "🚀 통합 분석기":
                 api_key_to_use = GEMINI_API_KEY
         else:
             st.info("서버에 기본 API 키가 설정되어 있지 않습니다. 개인 Gemini API 키를 입력해주세요.")
+
+            with st.expander("📖 API 키 발급 방법 (1분이면 끝! 완전 무료)", expanded=True):
+                st.markdown("""
+**컴퓨터 초보도 따라할 수 있는 3단계 가이드:**
+
+**1단계:** 아래 링크를 클릭하세요 (구글 로그인 필요):
+👉 **[Google AI Studio - API 키 발급 페이지](https://aistudio.google.com/app/apikey)**
+
+**2단계:** 화면에서 파란색 **'Create API key'** 버튼을 클릭하세요.
+→ 팝업이 뜨면 **'Create API key in new project'** 를 클릭하세요.
+→ ⚠️ **반드시 'in new project'를 선택하세요!** 이렇게 하면 과금이 절대 되지 않습니다.
+
+**3단계:** `AIzaSy...` 로 시작하는 긴 문자가 생성됩니다.
+→ 이 문자를 **복사(Ctrl+C)**하여 아래 입력창에 **붙여넣기(Ctrl+V)**하세요.
+
+✅ **완전 무료**입니다. 카드 등록이 필요 없고, 하루 1,500회까지 무료로 사용 가능합니다.
+                """)
+
             personal_key = st.text_input(
                 "Gemini API Key 입력:",
                 type="password",
                 placeholder="AIzaSy...",
-                help="Google AI Studio(aistudio.google.com/app/apikey)에서 무료 발급 가능"
             )
             if personal_key and personal_key.strip():
                 api_key_to_use = personal_key.strip()
 
         if api_key_to_use:
-            if st.button("✨ Gemini AI 정밀 분석 시작", use_container_width=True):
+            if st.button("✨ Gemini AI 정밀 분석 시작", use_container_width=True, type="primary"):
                 gemini_container = st.container()
                 with gemini_container:
                     st.subheader("🧠 Gemini AI 분석 진행 상황")
