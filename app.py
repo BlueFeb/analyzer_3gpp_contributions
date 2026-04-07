@@ -1206,15 +1206,47 @@ elif page == "🚀 통합 분석기":
         st.header("3️⃣ AI 정밀 분석 (Gemini)")
         st.write("추출된 결론을 Gemini AI로 의미 분석하여 더 정확한 제안 그룹핑 및 회사 정렬을 생성합니다.")
 
-        if not GEMINI_API_KEY:
-            st.warning("⚙️ 설정에서 Gemini API Key를 먼저 설정하세요.")
-        else:
-            st.info(
-                "💡 **무료 Gemini API 안내:** 무료 티어는 분당 처리량이 제한되어 있어 "
-                "문서가 많을수록 시간이 오래 걸립니다 (20개 문서 기준 약 2~5분). "
-                "API 과부하 시 자동으로 대기 후 재시도하니, **끝날 때까지 페이지를 닫지 마시고 기다려 주세요.**"
-            )
+        st.warning(
+            "⏱️ **소요 시간 안내:** 무료 Gemini API는 분당 처리량이 제한되어 있습니다. "
+            "문서 수에 따라 **약 5~15분** 이상 소요될 수 있으며, API 과부하 시 자동으로 "
+            "대기 후 재시도합니다. **분석이 끝날 때까지 페이지를 닫지 마시고 느긋하게 기다려 주세요.**"
+        )
 
+        # API 키 선택: 서버 키 vs 개인 키
+        api_key_to_use = None
+
+        if GEMINI_API_KEY:
+            key_mode = st.radio(
+                "API 키 선택:",
+                ("🔑 서버 기본 키 사용 (별도 설정 불필요)", "🔐 내 개인 Gemini API 키 사용"),
+                horizontal=True,
+                help="서버 기본 키의 일일 한도가 초과된 경우, 개인 무료 API 키를 입력하여 사용할 수 있습니다."
+            )
+            if "개인" in key_mode:
+                personal_key = st.text_input(
+                    "개인 Gemini API Key 입력:",
+                    type="password",
+                    placeholder="AIzaSy...",
+                    help="Google AI Studio(aistudio.google.com/app/apikey)에서 무료 발급. 결제 없는 프로젝트에서 만들면 과금 걱정 없습니다."
+                )
+                if personal_key and personal_key.strip():
+                    api_key_to_use = personal_key.strip()
+                else:
+                    st.caption("⬆️ 위에 개인 API 키를 입력하세요.")
+            else:
+                api_key_to_use = GEMINI_API_KEY
+        else:
+            st.info("서버에 기본 API 키가 설정되어 있지 않습니다. 개인 Gemini API 키를 입력해주세요.")
+            personal_key = st.text_input(
+                "Gemini API Key 입력:",
+                type="password",
+                placeholder="AIzaSy...",
+                help="Google AI Studio(aistudio.google.com/app/apikey)에서 무료 발급 가능"
+            )
+            if personal_key and personal_key.strip():
+                api_key_to_use = personal_key.strip()
+
+        if api_key_to_use:
             if st.button("✨ Gemini AI 정밀 분석 시작", use_container_width=True):
                 gemini_container = st.container()
                 with gemini_container:
@@ -1228,12 +1260,16 @@ elif page == "🚀 통합 분석기":
                         total_batches = (total_docs + 19) // 20
                         gemini_detail.caption(
                             f"📋 {total_docs}개 문서를 {total_batches}개 그룹으로 나누어 분석합니다. "
-                            f"무료 API 기준 약 {total_batches * 1 + 2}~{total_batches * 2 + 3}분 소요 예상."
+                            f"무료 API 기준 약 {max(5, total_batches * 2)}~{max(10, total_batches * 3 + 5)}분 소요 예상. "
+                            f"끝날 때까지 이 페이지를 닫지 마세요."
                         )
                     else:
-                        gemini_detail.caption(f"📋 {total_docs}개 문서를 일괄 분석합니다. 약 1~2분 소요 예상.")
+                        gemini_detail.caption(
+                            f"📋 {total_docs}개 문서를 일괄 분석합니다. 약 5~10분 소요 예상. "
+                            f"끝날 때까지 이 페이지를 닫지 마세요."
+                        )
 
-                    run_gemini_analysis(st.session_state.extracted_data, gemini_status, GEMINI_API_KEY)
+                    run_gemini_analysis(st.session_state.extracted_data, gemini_status, api_key_to_use)
 
         # Gemini 결과 표시
         if st.session_state.ai_summary_generated:
