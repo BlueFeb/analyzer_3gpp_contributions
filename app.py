@@ -194,15 +194,34 @@ def resolve_meeting_folder(wg, meeting_num):
     if not prefixes:
         return None
 
-    # 후보 폴더명 여러 변형 생성 (bis, -bis, BIS 등)
+    # 후보 폴더명 여러 변형 생성
+    # 사용자 입력: 124bis, 131bis, 133bis 등
+    # 실제 폴더: TSGR1_124b, TSGR3_131-bis, TSGR2_133bis 등
     base = f"{prefixes[0]}{meeting_num}"
     candidates_to_try = [base]
-    # bis/e 변형: 131bis → 131-bis, 131_bis
-    if re.search(r'\d(bis|e)\b', meeting_num, re.I):
-        num_part = re.match(r'(\d+)', meeting_num).group(1)
-        suffix = meeting_num[len(num_part):]
-        candidates_to_try.append(f"{prefixes[0]}{num_part}-{suffix}")
-        candidates_to_try.append(f"{prefixes[0]}{num_part}_{suffix}")
+
+    num_match = re.match(r'(\d+)', meeting_num)
+    if num_match:
+        num_part = num_match.group(1)
+        suffix = meeting_num[len(num_part):].lower().lstrip("-_")  # "bis", "e", "b" 등
+
+        if suffix:
+            # 모든 변형 추가: bis, -bis, _bis, b, -b, BIS
+            all_suffixes = set()
+            all_suffixes.add(suffix)                    # bis
+            all_suffixes.add(f"-{suffix}")              # -bis
+            all_suffixes.add(f"_{suffix}")              # _bis
+            if suffix == "bis":
+                all_suffixes.add("b")                   # b (RAN1 스타일)
+                all_suffixes.add("-b")
+            elif suffix == "b":
+                all_suffixes.add("bis")                 # bis
+                all_suffixes.add("-bis")                # -bis
+
+            for sfx in all_suffixes:
+                candidate = f"{prefixes[0]}{num_part}{sfx}"
+                if candidate not in candidates_to_try:
+                    candidates_to_try.append(candidate)
 
     # 시도 1: 단순 이름 변형들로 바로 접근
     for candidate in candidates_to_try:
@@ -249,13 +268,18 @@ def resolve_meeting_folder(wg, meeting_num):
             folder_num = folder_num_match.group(1)
             if folder_num != num_part:
                 continue
-            # 숫자 뒤 부분 체크 (bis, -bis, _bis, BIS 등)
-            folder_rest = after_prefix[len(folder_num):].lower()
+            # 숫자 뒤 부분 체크
+            folder_rest = after_prefix[len(folder_num):].lower().lstrip("-_")
             if suffix_part:
-                # suffix가 있으면 (bis, e 등) 그것과 매칭
-                # 131bis → "bis", 131-bis → "-bis", 131_bis → "_bis"
-                clean_rest = folder_rest.lstrip("-_")
-                if clean_rest.startswith(suffix_part):
+                # suffix 정규화: b ↔ bis 동일 취급
+                normalized_suffix = suffix_part.replace("-", "").replace("_", "")
+                normalized_folder = folder_rest.replace("-", "").replace("_", "")
+                # "b" 와 "bis" 를 동일하게 취급
+                def normalize_bis(s):
+                    if s.startswith("bis"): return "bis" + s[3:]
+                    if s.startswith("b") and (len(s) == 1 or not s[1].isalpha()): return "bis" + s[1:]
+                    return s
+                if normalize_bis(normalized_folder).startswith(normalize_bis(normalized_suffix)):
                     found.append(name)
             else:
                 # suffix 없으면 (순수 숫자) 정확히 숫자만 매칭
@@ -302,17 +326,33 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
     docs_url = f"https://www.3gpp.org/ftp/{ftp_path}/{meeting_folder}/Docs/"
 
     # TDoc 리스트 xlsx 파일명 구성 — 여러 변형 시도
-    # RAN3: 131-bis → TDoc_List_Meeting_RAN3#131-bis.xlsx
-    # RAN2: 133bis → TDoc_List_Meeting_RAN2#133bis.xlsx
+    # RAN1: 폴더 124b → xlsx는 #124-bis.xlsx
+    # RAN3: 폴더 131-bis → xlsx는 #131-bis.xlsx
+    # RAN2: 폴더 133bis → xlsx는 #133bis.xlsx
     xlsx_candidates = [f"{tdoc_prefix}{meeting_num}.xlsx"]
-    # 하이픈 없는 변형도 추가 (131-bis → 131bis)
-    if "-" in meeting_num:
-        xlsx_candidates.append(f"{tdoc_prefix}{meeting_num.replace('-', '')}.xlsx")
-    # 하이픈 있는 변형도 추가 (131bis → 131-bis)
-    else:
-        m = re.match(r'^(\d+)(bis|e|b)$', meeting_num, re.I)
-        if m:
-            xlsx_candidates.append(f"{tdoc_prefix}{m.group(1)}-{m.group(2)}.xlsx")
+
+    # meeting_num에서 숫자와 suffix 분리
+    mn_match = re.match(r'^(\d+)[-_]?(.*)', meeting_num, re.I)
+    if mn_match:
+        mn_num = mn_match.group(1)
+        mn_suffix = mn_match.group(2).lower()  # "bis", "b", "e", "" 등
+
+        # 모든 변형 생성
+        suffix_variants = set()
+        if mn_suffix:
+            suffix_variants.add(mn_suffix)                    # bis, b, e
+            suffix_variants.add(f"-{mn_suffix}")              # -bis, -b
+            if mn_suffix == "b":
+                suffix_variants.add("bis")
+                suffix_variants.add("-bis")
+            elif mn_suffix == "bis":
+                suffix_variants.add("b")
+                suffix_variants.add("-b")
+
+            for sfx in suffix_variants:
+                candidate = f"{tdoc_prefix}{mn_num}{sfx}.xlsx"
+                if candidate not in xlsx_candidates:
+                    xlsx_candidates.append(candidate)
 
     # 시도 1 & 2: 모든 파일명 후보를 순서대로 시도
     r = None
