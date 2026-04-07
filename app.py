@@ -293,33 +293,40 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
             break
 
     # SA2의 경우: TSGS2_168_City → 168, TSGS2_168bis_City → 168bis
-    # 도시명 등 부가 문자 제거: 숫자(+bis/e 등)만 추출
-    match = re.match(r'^(\d+(?:bis|e|b)?)', meeting_num, re.I)
+    # RAN3의 경우: TSGR3_131-bis → 131-bis (하이픈 보존)
+    # 도시명 등 부가 문자 제거: 숫자(+하이픈/bis/e 등)만 추출
+    match = re.match(r'^(\d+(?:-?bis|-?e|-?b)?)', meeting_num, re.I)
     if match:
         meeting_num = match.group(1)
 
     docs_url = f"https://www.3gpp.org/ftp/{ftp_path}/{meeting_folder}/Docs/"
 
-    # TDoc 리스트 xlsx 파일명 구성 (# 포함)
-    xlsx_filename = f"{tdoc_prefix}{meeting_num}.xlsx"
+    # TDoc 리스트 xlsx 파일명 구성 — 여러 변형 시도
+    # RAN3: 131-bis → TDoc_List_Meeting_RAN3#131-bis.xlsx
+    # RAN2: 133bis → TDoc_List_Meeting_RAN2#133bis.xlsx
+    xlsx_candidates = [f"{tdoc_prefix}{meeting_num}.xlsx"]
+    # 하이픈 없는 변형도 추가 (131-bis → 131bis)
+    if "-" in meeting_num:
+        xlsx_candidates.append(f"{tdoc_prefix}{meeting_num.replace('-', '')}.xlsx")
+    # 하이픈 있는 변형도 추가 (131bis → 131-bis)
+    else:
+        m = re.match(r'^(\d+)(bis|e|b)$', meeting_num, re.I)
+        if m:
+            xlsx_candidates.append(f"{tdoc_prefix}{m.group(1)}-{m.group(2)}.xlsx")
 
-    # 시도 1: # 인코딩하여 요청 (%23)
-    xlsx_url_encoded = f"{docs_url}{urllib.parse.quote(xlsx_filename)}"
+    # 시도 1 & 2: 모든 파일명 후보를 순서대로 시도
     r = None
-    try:
-        r = requests.get(xlsx_url_encoded, timeout=30, verify=False)
-        r.raise_for_status()
-    except Exception:
-        pass
-
-    # 시도 2: # 그대로 (일부 서버에서 동작)
-    if r is None or r.status_code != 200:
-        xlsx_url_raw = f"{docs_url}{xlsx_filename}"
+    for xlsx_filename in xlsx_candidates:
+        # URL 인코딩하여 요청 (%23 for #)
+        xlsx_url_encoded = f"{docs_url}{urllib.parse.quote(xlsx_filename)}"
         try:
-            r = requests.get(xlsx_url_raw, timeout=30, verify=False)
-            r.raise_for_status()
+            r = requests.get(xlsx_url_encoded, timeout=30, verify=False)
+            if r.status_code == 200:
+                append_log(f"TDoc xlsx 발견: {xlsx_filename}")
+                break
+            r = None
         except Exception:
-            pass
+            r = None
 
     # 시도 3: Docs 폴더 HTML을 파싱해서 실제 xlsx 파일명 찾기
     if r is None or r.status_code != 200:
