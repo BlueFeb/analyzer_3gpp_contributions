@@ -987,36 +987,34 @@ elif page == "🚀 통합 분석기":
     entries = []
 
     if input_method == "🔍 회의 번호로 자동 조회":
-        col_wg, col_meeting = st.columns([1, 2])
+        col_wg, col_num = st.columns([1, 2])
 
         with col_wg:
             wg = st.selectbox("Working Group:", list(WG_FTP_MAP.keys()))
 
-        with col_meeting:
-            # 회의 목록 가져오기
-            if st.button("📡 회의 목록 불러오기"):
-                with st.spinner("3GPP FTP에서 회의 목록 조회 중..."):
-                    st.session_state.meeting_list = list_meetings_from_ftp(wg)
-                    st.session_state.agenda_dict = {}
-                    st.session_state.all_entries = []
+        with col_num:
+            meeting_num_input = st.text_input(
+                "회의 번호 입력 (예: 133bis, 122, 168):",
+                placeholder="133bis",
+                help="3GPP 회의 번호만 입력. 예: RAN2#133bis → '133bis' 입력"
+            )
 
-            if st.session_state.meeting_list:
-                selected_meeting = st.selectbox(
-                    "회의 선택:",
-                    st.session_state.meeting_list,
-                    format_func=lambda x: x.replace("_", " "),
-                )
-            else:
-                selected_meeting = None
-                st.caption("위 버튼을 눌러 회의 목록을 불러오세요.")
+        if meeting_num_input and meeting_num_input.strip():
+            meeting_num = meeting_num_input.strip()
 
-        # Agenda 조회
-        if selected_meeting:
-            if st.button("📋 Agenda 목록 불러오기"):
-                with st.spinner(f"{selected_meeting}의 TDoc 리스트 다운로드 중..."):
-                    agenda_dict, all_entries = fetch_tdoc_list_xlsx(wg, selected_meeting)
+            # 회의 폴더명 자동 구성
+            prefixes = WG_MEETING_PREFIXES.get(wg, [])
+            meeting_folder = f"{prefixes[0]}{meeting_num}" if prefixes else meeting_num
+
+            st.caption(f"📂 경로: `ftp/{WG_FTP_MAP[wg]}/{meeting_folder}/Docs/`")
+
+            if st.button("📋 Agenda 불러오기", type="primary"):
+                with st.spinner(f"{wg}#{meeting_num} TDoc 리스트 다운로드 중..."):
+                    agenda_dict, all_entries = fetch_tdoc_list_xlsx(wg, meeting_folder)
                     st.session_state.agenda_dict = agenda_dict
                     st.session_state.all_entries = all_entries
+                    if not agenda_dict:
+                        st.error(f"❌ TDoc 리스트를 찾지 못했습니다. 회의 번호({meeting_num})와 폴더명({meeting_folder})을 확인하세요.")
 
         if st.session_state.agenda_dict:
             agenda_items = sorted(st.session_state.agenda_dict.keys())
@@ -1032,7 +1030,6 @@ elif page == "🚀 통합 분석기":
                 entries = st.session_state.agenda_dict[selected_agenda]
                 st.info(f"📄 **{selected_agenda}** — {len(entries)}개 문서가 분석 대상입니다.")
 
-                # 문서 목록 미리보기
                 with st.expander(f"문서 목록 미리보기 ({len(entries)}개)", expanded=False):
                     for e in entries[:30]:
                         st.text(f"  {e['doc']}  |  {e['company']}")
