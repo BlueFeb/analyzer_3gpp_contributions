@@ -420,10 +420,14 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
     if "agenda" not in col_map and "agenda_num" in col_map:
         col_map["agenda"] = col_map["agenda_num"]
 
-    # Fallback: 3GPP 표준 레이아웃 (A=TDoc, C=Source/Company, L=Agenda)
+    # agenda_num이 별도로 있으면 번호+설명을 합쳐서 사용
+    has_separate_num = "agenda_num" in col_map and "agenda" in col_map and col_map.get("agenda_num") != col_map.get("agenda")
+
+    # Fallback: 3GPP 표준 레이아웃 (A=TDoc, C=Source/Company, K=Agenda item, L=Agenda desc)
     if not header_row:
         header_row = 1
-        col_map = {"tdoc": 0, "company": 2, "agenda": 11}
+        col_map = {"tdoc": 0, "company": 2, "agenda_num": 10, "agenda": 11}
+        has_separate_num = True
 
     entries = []
     agenda_dict = {}
@@ -432,6 +436,7 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
         tdoc_idx = col_map.get("tdoc", 0)
         company_idx = col_map.get("company", 2)
         agenda_idx = col_map.get("agenda", 11)
+        agenda_num_idx = col_map.get("agenda_num", 10)
 
         if len(row) <= tdoc_idx:
             continue
@@ -439,13 +444,25 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
         tdoc_cell = row[tdoc_idx]
         company_cell = row[company_idx] if len(row) > company_idx else None
         agenda_cell = row[agenda_idx] if len(row) > agenda_idx else None
+        agenda_num_cell = row[agenda_num_idx] if has_separate_num and len(row) > agenda_num_idx else None
 
         tdoc_id = str(tdoc_cell.value or "").strip()
         if not tdoc_id:
             continue
 
         company = str(company_cell.value or "").strip() if company_cell else ""
-        agenda = str(agenda_cell.value or "").strip() if agenda_cell else ""
+        agenda_desc = str(agenda_cell.value or "").strip() if agenda_cell else ""
+        agenda_num = str(agenda_num_cell.value or "").strip() if agenda_num_cell else ""
+
+        # 번호 + 설명 합치기: "9.3.2.5 - Discussion on XYZ"
+        if agenda_num and agenda_desc and agenda_num != agenda_desc:
+            agenda = f"{agenda_num} - {agenda_desc}"
+        elif agenda_desc:
+            agenda = agenda_desc
+        elif agenda_num:
+            agenda = agenda_num
+        else:
+            agenda = ""
 
         # 하이퍼링크에서 다운로드 URL 추출
         if getattr(tdoc_cell, "hyperlink", None) and tdoc_cell.hyperlink.target:
