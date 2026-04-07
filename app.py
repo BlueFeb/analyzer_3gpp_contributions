@@ -107,26 +107,23 @@ WG_FTP_MAP = {
     "CT1": "tsg_ct/WG1_mm-cc-sm_ex-CN1",
     "CT3": "tsg_ct/WG3_interworking_ex-CN3",
     "CT4": "tsg_ct/WG4_protocollars_ex-CN4",
-    "CT6": "tsg_ct/WG6_Smart_Card_App_ex-T3",
 }
 
-# WG별 회의 폴더 prefix 후보들 (FTP 디렉토리에서 회의 폴더를 식별하는 패턴)
-# 일부 WG는 여러 명명 규칙을 사용 (예: SA2는 TSGS2_, S2_ 등)
+# WG별 회의 폴더 prefix (FTP에서 실제 확인된 값)
 WG_MEETING_PREFIXES = {
-    "RAN1": ["TSGR1_", "TSGR1#"],
-    "RAN2": ["TSGR2_", "TSGR2#"],
-    "RAN3": ["TSGR3_", "TSGR3#"],
-    "RAN4": ["TSGR4_", "TSGR4#"],
-    "SA1":  ["TSGS1_", "S1_", "S1-"],
-    "SA2":  ["TSGS2_", "S2_", "S2-"],
-    "SA3":  ["TSGS3_", "S3_", "S3-"],
-    "SA4":  ["TSGS4_", "S4_", "S4-"],
-    "SA5":  ["TSGS5_", "S5_", "S5-"],
-    "SA6":  ["TSGS6_", "S6_", "S6-"],
-    "CT1":  ["C1_", "C1-", "TSGC1_"],
-    "CT3":  ["C3_", "C3-", "TSGC3_"],
-    "CT4":  ["C4_", "C4-", "TSGC4_"],
-    "CT6":  ["C6_", "C6-", "TSGC6_"],
+    "RAN1": ["TSGR1_"],
+    "RAN2": ["TSGR2_"],
+    "RAN3": ["TSGR3_"],
+    "RAN4": ["TSGR4_"],
+    "SA1":  ["TSGS1_"],
+    "SA2":  ["TSGS2_"],
+    "SA3":  ["TSGS3_"],
+    "SA4":  ["TSGS4_"],
+    "SA5":  ["TSGS5_"],
+    "SA6":  ["TSGS6_"],
+    "CT1":  ["TSGC1_"],
+    "CT3":  ["TSGC3_"],
+    "CT4":  ["CT4_"],
 }
 
 # WG별 TDoc 리스트 xlsx 파일명 패턴
@@ -144,7 +141,6 @@ WG_TDOC_PREFIX = {
     "CT1": "TDoc_List_Meeting_CT1#",
     "CT3": "TDoc_List_Meeting_CT3#",
     "CT4": "TDoc_List_Meeting_CT4#",
-    "CT6": "TDoc_List_Meeting_CT6#",
 }
 
 
@@ -182,6 +178,66 @@ def list_meetings_from_ftp(wg):
     except Exception as e:
         append_log(f"FTP 회의 목록 조회 오류: {e}")
         return []
+
+
+def resolve_meeting_folder(wg, meeting_num):
+    """
+    사용자가 입력한 회의 번호(예: 168)로 FTP에서 실제 폴더명을 찾는다.
+    RAN 그룹: TSGR2_133bis (번호만 — 바로 매칭)
+    SA/CT 그룹: TSGS2_168_Goteborg_2025-04 (도시명+날짜 포함 — 디렉토리에서 검색 필요)
+
+    반환: 실제 폴더명 문자열, 못 찾으면 None
+    """
+    ftp_path = WG_FTP_MAP.get(wg, "")
+    prefixes = WG_MEETING_PREFIXES.get(wg, [])
+    if not prefixes:
+        return None
+
+    # 후보 폴더명 구성
+    simple_folder = f"{prefixes[0]}{meeting_num}"
+
+    # 시도 1: 단순 이름으로 바로 접근 (RAN 그룹은 대부분 이것으로 됨)
+    test_url = f"https://www.3gpp.org/ftp/{ftp_path}/{simple_folder}/Docs/"
+    try:
+        r = requests.head(test_url, timeout=10, verify=False, allow_redirects=True)
+        if r.status_code == 200:
+            return simple_folder
+    except Exception:
+        pass
+
+    # 시도 2: FTP 디렉토리 리스팅에서 매칭되는 폴더 찾기
+    dir_url = f"https://www.3gpp.org/ftp/{ftp_path}/"
+    try:
+        r = requests.get(dir_url, timeout=15, verify=False,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+
+        all_links = re.findall(r'href="([^"?]+)"', r.text)
+        all_links += re.findall(r'>([A-Z][^<]{3,80})<', r.text)
+
+        candidates = []
+        search_pattern = f"{prefixes[0]}{meeting_num}".upper()
+
+        for link in all_links:
+            name = link.rstrip("/").split("/")[-1].strip()
+            if not name:
+                continue
+            name_upper = name.upper()
+            if name_upper.startswith(search_pattern):
+                rest = name_upper[len(search_pattern):]
+                if rest == "" or rest.startswith("_") or rest.startswith("/"):
+                    candidates.append(name)
+
+        if candidates:
+            candidates.sort(key=len)
+            append_log(f"폴더 후보: {candidates}")
+            return candidates[0]
+
+    except Exception as e:
+        append_log(f"폴더 검색 오류: {e}")
+
+    return None
 
 
 def fetch_tdoc_list_xlsx(wg, meeting_folder):
@@ -262,15 +318,27 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
     for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=10), start=1):
         for col_idx, cell in enumerate(row):
             val = str(cell.value or "").strip().lower()
-            if any(kw in val for kw in ["tdoc", "td#", "td number", "document"]) and "tdoc" not in col_map:
+            # TDoc 컬럼
+            if any(kw in val for kw in ["tdoc", "td#", "td number"]) and "tdoc" not in col_map:
                 col_map["tdoc"] = col_idx
+            # Source/Company 컬럼
             if any(kw in val for kw in ["source", "company", "submitting"]) and "company" not in col_map:
                 col_map["company"] = col_idx
-            if "agenda" in val and "company" not in val:
-                col_map["agenda"] = col_idx
-        if "tdoc" in col_map and "agenda" in col_map:
+            # Agenda 컬럼 — "agenda item description"을 우선, "agenda item"만 있으면 그것 사용
+            if "agenda" in val:
+                if "description" in val:
+                    # "Agenda item description" → 이게 진짜 agenda 텍스트
+                    col_map["agenda"] = col_idx
+                elif "agenda" not in col_map:
+                    # "Agenda item" (번호) → description이 없을 때만 사용
+                    col_map["agenda_num"] = col_idx
+        if "tdoc" in col_map and ("agenda" in col_map or "agenda_num" in col_map):
             header_row = row_idx
             break
+
+    # agenda description이 없으면 agenda_num 사용
+    if "agenda" not in col_map and "agenda_num" in col_map:
+        col_map["agenda"] = col_map["agenda_num"]
 
     # Fallback: 3GPP 표준 레이아웃 (A=TDoc, C=Source/Company, L=Agenda)
     if not header_row:
@@ -1002,19 +1070,24 @@ elif page == "🚀 통합 분석기":
         if meeting_num_input and meeting_num_input.strip():
             meeting_num = meeting_num_input.strip()
 
-            # 회의 폴더명 자동 구성
-            prefixes = WG_MEETING_PREFIXES.get(wg, [])
-            meeting_folder = f"{prefixes[0]}{meeting_num}" if prefixes else meeting_num
-
-            st.caption(f"📂 경로: `ftp/{WG_FTP_MAP[wg]}/{meeting_folder}/Docs/`")
-
             if st.button("📋 Agenda 불러오기", type="primary"):
-                with st.spinner(f"{wg}#{meeting_num} TDoc 리스트 다운로드 중..."):
-                    agenda_dict, all_entries = fetch_tdoc_list_xlsx(wg, meeting_folder)
-                    st.session_state.agenda_dict = agenda_dict
-                    st.session_state.all_entries = all_entries
-                    if not agenda_dict:
-                        st.error(f"❌ TDoc 리스트를 찾지 못했습니다. 회의 번호({meeting_num})와 폴더명({meeting_folder})을 확인하세요.")
+                with st.spinner(f"{wg}#{meeting_num} 폴더 검색 및 TDoc 리스트 다운로드 중..."):
+                    # 실제 폴더명 찾기 (SA2: 168 → TSGS2_168_Goteborg_2025-04)
+                    meeting_folder = resolve_meeting_folder(wg, meeting_num)
+                    if meeting_folder:
+                        st.session_state["resolved_folder"] = meeting_folder
+                        agenda_dict, all_entries = fetch_tdoc_list_xlsx(wg, meeting_folder)
+                        st.session_state.agenda_dict = agenda_dict
+                        st.session_state.all_entries = all_entries
+                        if not agenda_dict:
+                            st.error(f"❌ TDoc 리스트를 찾지 못했습니다. 폴더({meeting_folder})에 xlsx가 없습니다.")
+                    else:
+                        st.error(f"❌ {wg}#{meeting_num}에 해당하는 폴더를 찾지 못했습니다. 번호를 확인하세요.")
+                        st.session_state.agenda_dict = {}
+                        st.session_state.all_entries = []
+
+            if st.session_state.get("resolved_folder"):
+                st.caption(f"📂 `ftp/{WG_FTP_MAP[wg]}/{st.session_state['resolved_folder']}/Docs/`")
 
         if st.session_state.agenda_dict:
             agenda_items = sorted(st.session_state.agenda_dict.keys())
