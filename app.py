@@ -96,7 +96,7 @@ def read_excel_from_bytes(uploaded_file):
 WG_FTP_MAP = {
     "RAN1": "tsg_ran/WG1_RL1",
     "RAN2": "tsg_ran/WG2_RL2",
-    "RAN3": "tsg_ran/WG3_IU",
+    "RAN3": "tsg_ran/WG3_Iu",
     "RAN4": "tsg_ran/WG4_Radio",
     "SA1": "tsg_sa/WG1_Serv",
     "SA2": "tsg_sa/WG2_Arch",
