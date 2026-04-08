@@ -1066,17 +1066,9 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
     try:
         valid_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
 
-        # 사용자 선택에 따라 모델 우선순위 결정
-        preferred_tier = st.session_state.get("model_tier", "flash")
-
-        if preferred_tier == "pro":
-            # Pro 우선: pro 모델 먼저 찾고, 없으면 flash fallback
-            target = next((m for m in valid_models if 'pro' in m.lower() and 'vision' not in m.lower()),
-                          next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()), valid_models[-1]))
-        else:
-            # Flash 우선 (기본): flash 먼저, 없으면 pro fallback
-            target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
-                          next((m for m in valid_models if 'pro' in m.lower() and 'vision' not in m.lower()), valid_models[-1]))
+        # Flash 모델 우선 사용 (무료 API 호환)
+        target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
+                       next((m for m in valid_models if 'pro' in m.lower() and 'vision' not in m.lower()), valid_models[-1]))
 
         model_display = target.split('/')[-1]
         model = genai.GenerativeModel(target)
@@ -1348,50 +1340,7 @@ elif page == "ℹ️ 가이드":
 **무료 한도:**
 - **gemini-2.0-flash:** 분당 15회, 일 1,500회
 - 1회 분석에 약 1~3회 API 호출 → **하루 수백 회 분석 가능**
-    """)
-
-    st.subheader("🔵 유료 API 키 발급 (Pro/대용량 사용자)")
-    st.markdown("""
-문서가 아주 많거나, 더 똑똑한 `gemini-2.5-pro` 모델을 사용하고 싶다면 유료 API를 사용할 수 있습니다.
-
-**유료의 장점:**
-- **gemini-2.5-pro** 등 최신 고성능 모델 사용 가능 (더 정확한 분석)
-- **속도 제한 대폭 완화** (분당 60회 이상)
-- **대용량 처리** 가능 (긴 문서도 한 번에 분석)
-
-**발급 방법:**
-
-**1단계: Google Cloud 결제 계정 등록**
-1. [Google Cloud Console](https://console.cloud.google.com/) 접속 및 로그인
-2. 상단 메뉴바의 **'프로젝트 선택'** → **'새 프로젝트(New Project)'** 클릭
-3. 프로젝트 이름(예: `3GPP-Pro`) 입력 후 **'만들기'** 클릭
-4. 좌측 메뉴 **'결제(Billing)'** → **'결제 계정 연결/추가'** → 카드 정보 등록
-
-> 💡 구글이 카드 확인을 위해 1달러를 가결제 후 즉시 취소할 수 있습니다.
-
-**2단계: 유료 프로젝트에서 API 키 생성**
-1. [Google AI Studio](https://aistudio.google.com/app/apikey) 접속
-2. **`Create API key`** 클릭
-3. ⭐ 팝업에서 바로 파란 버튼을 누르지 말고, **'Search projects'** 클릭!
-4. 1단계에서 카드를 등록한 **프로젝트 이름(`3GPP-Pro`)을 선택**
-5. **`Create API key in existing project`** 클릭
-6. 생성된 `AIzaSy...` 키를 복사하여 분석기에 입력
-
-**비용 참고:**
-- gemini-2.5-pro: 입력 $1.25/백만토큰, 출력 $10/백만토큰
-- 기고문 50개 분석 1회 ≈ 약 $0.05~$0.15 (50~150원)
-    """)
-
-    st.subheader("💡 무료 vs 유료 비교")
-    st.markdown("""
-| 항목 | 🟢 무료 (Flash) | 🔵 유료 (Pro) |
-|------|---------------|--------------|
-| 모델 | gemini-2.0-flash | gemini-2.5-pro |
-| 비용 | $0 | 분석 1회당 ~100원 |
-| 속도 제한 | 분당 15회 | 분당 60회+ |
-| 분석 품질 | 좋음 | 매우 우수 |
-| 카드 등록 | 불필요 | 필요 |
-| 추천 대상 | 일반 사용자 | 대용량/정밀 분석 필요 시 |
+- 한도를 초과하면 과금 없이 그냥 에러가 납니다 (과금 절대 불가)
     """)
 
     # ── 분석 결과 설명 ──
@@ -1663,20 +1612,6 @@ elif page == "🚀 통합 분석기":
                 api_key_to_use = personal_key.strip()
 
         if api_key_to_use:
-            # 모델 선택 (무료 Flash vs 유료 Pro)
-            model_tier = st.radio(
-                "AI 모델 선택:",
-                (
-                    "⚡ Flash (무료 — 빠르고 가벼움)",
-                    "🧠 Pro (유료 API 전용 — 더 정확하고 정밀)"
-                ),
-                horizontal=True,
-                help="무료 API 키는 Flash만 사용 가능합니다. Pro 모델은 유료 API 키(결제 계정 연결)가 필요합니다."
-            )
-            st.session_state["model_tier"] = "pro" if "Pro" in model_tier else "flash"
-
-            if "Pro" in model_tier:
-                st.info("💎 **Pro 모델 선택됨:** 유료 API 키가 필요합니다. 무료 키로는 Pro 모델을 사용할 수 없습니다. 가이드 탭에서 유료 API 발급 방법을 확인하세요.")
 
             st.markdown("")
             st.markdown("#### 👇 준비가 되었으면 아래 버튼을 클릭하세요")
