@@ -144,6 +144,38 @@ WG_TDOC_PREFIX = {
 }
 
 
+def _request_with_retry(url, method="get", max_retries=3, timeout=60, **kwargs):
+    """3GPP FTP 서버 요청에 재시도 로직 추가. 서버가 느리거나 불안정할 때 대응."""
+    kwargs.setdefault("verify", False)
+    kwargs.setdefault("headers", {"User-Agent": "Mozilla/5.0"})
+    kwargs["timeout"] = timeout
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            if method == "head":
+                r = requests.head(url, **kwargs)
+            else:
+                r = requests.get(url, **kwargs)
+            if r.status_code == 200:
+                return r
+            last_error = f"HTTP {r.status_code}"
+        except requests.exceptions.Timeout:
+            last_error = f"Timeout ({timeout}초)"
+            append_log(f"3GPP 서버 타임아웃 (시도 {attempt+1}/{max_retries}): {url[:80]}")
+        except requests.exceptions.ConnectionError:
+            last_error = "연결 실패"
+            append_log(f"3GPP 서버 연결 실패 (시도 {attempt+1}/{max_retries}): {url[:80]}")
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < max_retries - 1:
+            time.sleep(3 * (attempt + 1))  # 3초, 6초, 9초 대기
+
+    append_log(f"3GPP 서버 요청 최종 실패: {last_error}")
+    return None
+
+
 def list_meetings_from_ftp(wg):
     """FTP 디렉토리 목록에서 해당 WG의 회의 폴더 목록을 가져온다."""
     ftp_path = WG_FTP_MAP.get(wg)
@@ -226,20 +258,16 @@ def resolve_meeting_folder(wg, meeting_num):
     # 시도 1: 단순 이름 변형들로 바로 접근
     for candidate in candidates_to_try:
         test_url = f"https://www.3gpp.org/ftp/{ftp_path}/{candidate}/Docs/"
-        try:
-            r = requests.head(test_url, timeout=10, verify=False, allow_redirects=True)
-            if r.status_code == 200:
-                return candidate
-        except Exception:
-            pass
+        r = _request_with_retry(test_url, method="head", max_retries=2, timeout=15)
+        if r and r.status_code == 200:
+            return candidate
 
     # 시도 2: FTP 디렉토리 리스팅에서 매칭되는 폴더 찾기
     dir_url = f"https://www.3gpp.org/ftp/{ftp_path}/"
+    r = _request_with_retry(dir_url, max_retries=3, timeout=30)
+    if not r:
+        return None
     try:
-        r = requests.get(dir_url, timeout=15, verify=False,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return None
 
         all_links = re.findall(r'href="([^"?]+)"', r.text)
         all_links += re.findall(r'>([A-Z][^<]{3,80})<', r.text)
@@ -354,38 +382,31 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
                 if candidate not in xlsx_candidates:
                     xlsx_candidates.append(candidate)
 
-    # 시도 1 & 2: 모든 파일명 후보를 순서대로 시도
+    # 시도 1 & 2: 모든 파일명 후보를 순서대로 시도 (재시도 포함)
     r = None
     for xlsx_filename in xlsx_candidates:
-        # URL 인코딩하여 요청 (%23 for #)
         xlsx_url_encoded = f"{docs_url}{urllib.parse.quote(xlsx_filename)}"
-        try:
-            r = requests.get(xlsx_url_encoded, timeout=30, verify=False)
-            if r.status_code == 200:
-                append_log(f"TDoc xlsx 발견: {xlsx_filename}")
-                break
-            r = None
-        except Exception:
-            r = None
+        resp = _request_with_retry(xlsx_url_encoded, max_retries=3, timeout=60)
+        if resp and resp.status_code == 200:
+            r = resp
+            append_log(f"TDoc xlsx 발견: {xlsx_filename}")
+            break
 
     # 시도 3: Docs 폴더 HTML을 파싱해서 실제 xlsx 파일명 찾기
-    if r is None or r.status_code != 200:
-        try:
-            dir_resp = requests.get(docs_url, timeout=15, verify=False)
-            dir_resp.raise_for_status()
-            # TDoc_List로 시작하는 xlsx 파일 찾기
-            xlsx_links = re.findall(r'href="([^"]*TDoc_List[^"]*\.xlsx)"', dir_resp.text, re.I)
-            if xlsx_links:
-                actual_filename = xlsx_links[0].split("/")[-1]
-                actual_url = f"{docs_url}{urllib.parse.quote(actual_filename)}"
-                r = requests.get(actual_url, timeout=30, verify=False)
-                r.raise_for_status()
-        except Exception as e:
-            append_log(f"TDoc 리스트 다운로드 실패 (모든 시도): {e}")
-            return {}, []
+    if r is None:
+        dir_resp = _request_with_retry(docs_url, max_retries=2, timeout=30)
+        if dir_resp:
+            try:
+                xlsx_links = re.findall(r'href="([^"]*TDoc_List[^"]*\.xlsx)"', dir_resp.text, re.I)
+                if xlsx_links:
+                    actual_filename = xlsx_links[0].split("/")[-1]
+                    actual_url = f"{docs_url}{urllib.parse.quote(actual_filename)}"
+                    r = _request_with_retry(actual_url, max_retries=3, timeout=60)
+            except Exception as e:
+                append_log(f"TDoc 리스트 디렉토리 검색 실패: {e}")
 
-    if r is None or r.status_code != 200:
-        append_log(f"TDoc 리스트 다운로드 실패: {xlsx_filename}")
+    if r is None:
+        append_log(f"TDoc 리스트 다운로드 최종 실패")
         return {}, []
 
     # Parse xlsx
@@ -1041,14 +1062,27 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 [1차 추출 결과]
 {intermediate_text}"""
 
-    status_elem.text("🧠 Gemini AI 분석 중...")
+    status_elem.text("🧠 Gemini AI 분석 중... 모델을 선택하고 있습니다...")
     try:
         valid_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
-                       next((m for m in valid_models if 'pro' in m.lower() and 'vision' not in m.lower()), valid_models[-1]))
+
+        # 사용자 선택에 따라 모델 우선순위 결정
+        preferred_tier = st.session_state.get("model_tier", "flash")
+
+        if preferred_tier == "pro":
+            # Pro 우선: pro 모델 먼저 찾고, 없으면 flash fallback
+            target = next((m for m in valid_models if 'pro' in m.lower() and 'vision' not in m.lower()),
+                          next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()), valid_models[-1]))
+        else:
+            # Flash 우선 (기본): flash 먼저, 없으면 pro fallback
+            target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
+                          next((m for m in valid_models if 'pro' in m.lower() and 'vision' not in m.lower()), valid_models[-1]))
+
         model_display = target.split('/')[-1]
         model = genai.GenerativeModel(target)
-        strict_config = {"temperature": 0.0}  # 0.0으로 더 엄격하게
+        strict_config = {"temperature": 0.0}
+
+        status_elem.text(f"🧠 모델: {model_display} — 분석을 시작합니다...")
 
         total_docs = len(extracted_data)
         response = None
@@ -1271,10 +1305,124 @@ if page == "⚙️ 설정":
         st.info("상태: ⚠️ 미설정 (서버에서 직접 다운로드)")
 
 elif page == "ℹ️ 가이드":
-    st.title("ℹ️ 가이드")
-    st.write("**기본 분석 (Output 1·2):** 항상 생성. 원본과 동일한 결과물.")
-    st.write("**Gemini 분석 (Output 3):** 선택. 서버에 고정된 키 사용, 사용자 키 입력 불필요.")
-    st.write("**Cloud Function:** 설정하면 문서를 클라우드에서 처리 (내 PC 다운로드 없음).")
+    st.title("ℹ️ 사용 가이드")
+
+    # ── 기본 사용법 ──
+    st.header("🔰 기본 사용법")
+    st.markdown("""
+**1단계:** 🔍 회의 번호로 자동 조회 → Working Group과 회의 번호 입력 → Agenda 불러오기
+
+**2단계:** 📋 Agenda 선택 → 🚀 기본 분석 실행
+- **Output 1:** 각 기고문의 결론(Conclusion) 부분을 서식 그대로 취합한 문서
+- **Output 2:** TF-IDF 단어 빈도 분석으로 유사한 Proposal을 자동 그룹핑한 요약
+
+**3단계:** ✨ Gemini AI 정밀 분석 (선택)
+- AI가 의미 기반으로 제안을 그룹핑하고, 지지 회사별로 정렬
+- 각 제안에 대해 원문 근거 문서와 인용 제공
+    """)
+
+    # ── Gemini API 발급 가이드 ──
+    st.markdown("---")
+    st.header("🔑 Gemini API 키 발급 가이드")
+
+    st.subheader("🟢 무료 API 키 발급 (추천, 1분 소요)")
+    st.markdown("""
+**누구나 무료**로 발급받을 수 있으며, **카드 등록이 필요 없습니다.**
+
+**1단계:** 아래 링크를 클릭하여 Google AI Studio에 접속합니다 (구글 로그인 필요):
+
+👉 **[Google AI Studio - API 키 발급 페이지](https://aistudio.google.com/app/apikey)**
+
+**2단계:** 화면에서 파란색 **`Create API key`** 버튼을 클릭합니다.
+
+**3단계:** 팝업이 뜨면 **`Create API key in new project`** 를 클릭합니다.
+
+> ⚠️ **중요:** 반드시 **"in new project"**를 선택하세요!
+> 이렇게 하면 결제 계정이 연결되지 않은 별도 프로젝트에 키가 생성되어, **절대 과금되지 않습니다.**
+> 무료 한도(일 1,500회)를 초과하면 그냥 에러가 나고 끝입니다.
+
+**4단계:** `AIzaSy...` 로 시작하는 긴 문자열이 생성됩니다. 이것이 API 키입니다.
+
+**5단계:** 이 문자열을 **복사(Ctrl+C)**하여 분석기의 API 키 입력창에 **붙여넣기(Ctrl+V)**하세요.
+
+**무료 한도:**
+- **gemini-2.0-flash:** 분당 15회, 일 1,500회
+- 1회 분석에 약 1~3회 API 호출 → **하루 수백 회 분석 가능**
+    """)
+
+    st.subheader("🔵 유료 API 키 발급 (Pro/대용량 사용자)")
+    st.markdown("""
+문서가 아주 많거나, 더 똑똑한 `gemini-2.5-pro` 모델을 사용하고 싶다면 유료 API를 사용할 수 있습니다.
+
+**유료의 장점:**
+- **gemini-2.5-pro** 등 최신 고성능 모델 사용 가능 (더 정확한 분석)
+- **속도 제한 대폭 완화** (분당 60회 이상)
+- **대용량 처리** 가능 (긴 문서도 한 번에 분석)
+
+**발급 방법:**
+
+**1단계: Google Cloud 결제 계정 등록**
+1. [Google Cloud Console](https://console.cloud.google.com/) 접속 및 로그인
+2. 상단 메뉴바의 **'프로젝트 선택'** → **'새 프로젝트(New Project)'** 클릭
+3. 프로젝트 이름(예: `3GPP-Pro`) 입력 후 **'만들기'** 클릭
+4. 좌측 메뉴 **'결제(Billing)'** → **'결제 계정 연결/추가'** → 카드 정보 등록
+
+> 💡 구글이 카드 확인을 위해 1달러를 가결제 후 즉시 취소할 수 있습니다.
+
+**2단계: 유료 프로젝트에서 API 키 생성**
+1. [Google AI Studio](https://aistudio.google.com/app/apikey) 접속
+2. **`Create API key`** 클릭
+3. ⭐ 팝업에서 바로 파란 버튼을 누르지 말고, **'Search projects'** 클릭!
+4. 1단계에서 카드를 등록한 **프로젝트 이름(`3GPP-Pro`)을 선택**
+5. **`Create API key in existing project`** 클릭
+6. 생성된 `AIzaSy...` 키를 복사하여 분석기에 입력
+
+**비용 참고:**
+- gemini-2.5-pro: 입력 $1.25/백만토큰, 출력 $10/백만토큰
+- 기고문 50개 분석 1회 ≈ 약 $0.05~$0.15 (50~150원)
+    """)
+
+    st.subheader("💡 무료 vs 유료 비교")
+    st.markdown("""
+| 항목 | 🟢 무료 (Flash) | 🔵 유료 (Pro) |
+|------|---------------|--------------|
+| 모델 | gemini-2.0-flash | gemini-2.5-pro |
+| 비용 | $0 | 분석 1회당 ~100원 |
+| 속도 제한 | 분당 15회 | 분당 60회+ |
+| 분석 품질 | 좋음 | 매우 우수 |
+| 카드 등록 | 불필요 | 필요 |
+| 추천 대상 | 일반 사용자 | 대용량/정밀 분석 필요 시 |
+    """)
+
+    # ── 분석 결과 설명 ──
+    st.markdown("---")
+    st.header("📊 분석 결과 설명")
+    st.markdown("""
+**Output 1 (Conclusions 취합):**
+- 각 기고문에서 Conclusion/Summary 섹션만 추출
+- 원문의 서식(Bold, 폰트 등)을 그대로 보존
+- 문서 번호, 회사명, 제목, 링크가 표 형태로 정리
+
+**Output 2 (TF-IDF 요약):**
+- 단어 빈도(TF-IDF) 기반으로 유사한 Proposal을 자동 클러스터링
+- 지지 회사 수가 많은 순서대로 정렬
+- AI를 사용하지 않으므로 항상 즉시 결과 생성
+
+**Output 3 (Gemini AI 정밀 분석):**
+- AI가 의미 기반으로 제안의 기술적 유사성을 판단
+- 각 제안에 대해 근거 문서와 원문 인용 제공
+- 할루시네이션 방지 시스템으로 검증된 문서만 인용
+    """)
+
+    # ── 보안 안내 ──
+    st.markdown("---")
+    st.header("🔒 개인정보 및 보안")
+    st.markdown("""
+- **API 키 보호:** 입력한 API 키는 화면에 `****` 형태로 가려지며, 서버에 저장되지 않습니다.
+- **에러 메시지 보안:** 오류 발생 시에도 API 키가 화면에 표시되지 않도록 자동 마스킹됩니다.
+- **문서 데이터:** 다운로드된 기고문은 분석 완료 즉시 서버에서 자동 삭제됩니다.
+- **세션 종료:** 브라우저를 닫으면 모든 데이터가 즉시 소멸됩니다.
+    """)
 
 # ─── Main ───
 elif page == "🚀 통합 분석기":
@@ -1310,7 +1458,7 @@ elif page == "🚀 통합 분석기":
             meeting_num = meeting_num_input.strip()
 
             if st.button("📋 Agenda 불러오기", type="primary"):
-                with st.spinner(f"{wg}#{meeting_num} 폴더 검색 및 TDoc 리스트 다운로드 중..."):
+                with st.spinner(f"{wg}#{meeting_num} 폴더 검색 및 TDoc 리스트 다운로드 중... (3GPP 서버가 느릴 수 있습니다)"):
                     # 실제 폴더명 찾기 (SA2: 168 → TSGS2_168_Goteborg_2025-04)
                     meeting_folder = resolve_meeting_folder(wg, meeting_num)
                     if meeting_folder:
@@ -1319,9 +1467,20 @@ elif page == "🚀 통합 분석기":
                         st.session_state.agenda_dict = agenda_dict
                         st.session_state.all_entries = all_entries
                         if not agenda_dict:
-                            st.error(f"❌ TDoc 리스트를 찾지 못했습니다. 폴더({meeting_folder})에 xlsx가 없습니다.")
+                            st.error(
+                                f"❌ **TDoc 리스트를 찾지 못했습니다.**\n\n"
+                                f"폴더 `{meeting_folder}`는 존재하지만 xlsx 파일을 다운로드하지 못했습니다.\n\n"
+                                f"**원인:** 3GPP 서버가 일시적으로 느리거나, 해당 회의의 TDoc 리스트가 아직 업로드되지 않았을 수 있습니다.\n\n"
+                                f"**해결:** 잠시 후 다시 시도하거나, 'Excel 파일 업로드' 방식을 사용하세요."
+                            )
                     else:
-                        st.error(f"❌ {wg}#{meeting_num}에 해당하는 폴더를 찾지 못했습니다. 번호를 확인하세요.")
+                        st.error(
+                            f"❌ **{wg}#{meeting_num}에 해당하는 폴더를 찾지 못했습니다.**\n\n"
+                            f"**가능한 원인:**\n"
+                            f"- 회의 번호가 잘못되었을 수 있습니다\n"
+                            f"- 3GPP 서버가 일시적으로 응답하지 않습니다\n\n"
+                            f"**해결:** 번호를 확인하고 다시 시도하거나, 잠시 후 재시도하세요."
+                        )
                         st.session_state.agenda_dict = {}
                         st.session_state.all_entries = []
 
@@ -1504,6 +1663,21 @@ elif page == "🚀 통합 분석기":
                 api_key_to_use = personal_key.strip()
 
         if api_key_to_use:
+            # 모델 선택 (무료 Flash vs 유료 Pro)
+            model_tier = st.radio(
+                "AI 모델 선택:",
+                (
+                    "⚡ Flash (무료 — 빠르고 가벼움)",
+                    "🧠 Pro (유료 API 전용 — 더 정확하고 정밀)"
+                ),
+                horizontal=True,
+                help="무료 API 키는 Flash만 사용 가능합니다. Pro 모델은 유료 API 키(결제 계정 연결)가 필요합니다."
+            )
+            st.session_state["model_tier"] = "pro" if "Pro" in model_tier else "flash"
+
+            if "Pro" in model_tier:
+                st.info("💎 **Pro 모델 선택됨:** 유료 API 키가 필요합니다. 무료 키로는 Pro 모델을 사용할 수 없습니다. 가이드 탭에서 유료 API 발급 방법을 확인하세요.")
+
             st.markdown("")
             st.markdown("#### 👇 준비가 되었으면 아래 버튼을 클릭하세요")
             if st.button("✨ Gemini AI 정밀 분석 시작", use_container_width=True, type="primary"):
