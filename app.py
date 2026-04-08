@@ -68,6 +68,76 @@ CLOUD_FUNCTION_URL = os.environ.get("CLOUD_FUNCTION_URL", "") or st.secrets.get(
 
 
 # ==========================================
+# 2b. 회사명 정규화 (동일 그룹 통합)
+# ==========================================
+COMPANY_ALIASES = {
+    # ZTE 그룹
+    "sanechips": "ZTE",
+    "zte corporation": "ZTE",
+    "zte wistron": "ZTE",
+    "zte": "ZTE",
+    # Huawei 그룹
+    "hisilicon": "Huawei",
+    "hisillicon": "Huawei",
+    "huawei technologies": "Huawei",
+    "huawei": "Huawei",
+    "huawei, hisilicon": "Huawei",
+    "hisilicon, huawei": "Huawei",
+    # 기타 흔한 변형
+    "samsung electronics": "Samsung",
+    "samsung": "Samsung",
+    "qualcomm incorporated": "Qualcomm",
+    "qualcomm inc.": "Qualcomm",
+    "qualcomm": "Qualcomm",
+    "nokia corporation": "Nokia",
+    "nokia, nokia shanghai bell": "Nokia",
+    "nokia shanghai bell": "Nokia",
+    "lg electronics": "LG Electronics",
+    "apple inc.": "Apple",
+    "ericsson": "Ericsson",
+    "mediatek inc.": "MediaTek",
+    "mediatek": "MediaTek",
+    "oppo": "OPPO",
+    "vivo": "vivo",
+    "xiaomi": "Xiaomi",
+    "catt": "CATT",
+    "china telecom": "China Telecom",
+    "china mobile": "China Mobile",
+    "china unicom": "China Unicom",
+    "intel corporation": "Intel",
+    "intel": "Intel",
+    "interdigital": "InterDigital",
+}
+
+
+def normalize_company(name):
+    """회사명을 정규화. 'Sanechips' → 'ZTE', 'HiSilicon' → 'Huawei' 등."""
+    if not name or not name.strip():
+        return name or ""
+    cleaned = name.strip()
+    lower = cleaned.lower()
+    # 정확 매칭
+    if lower in COMPANY_ALIASES:
+        return COMPANY_ALIASES[lower]
+    # 부분 매칭: alias 키가 회사명에 포함되는 경우만 (최소 3글자 이상)
+    for alias_key, alias_val in COMPANY_ALIASES.items():
+        if len(alias_key) >= 3 and alias_key in lower:
+            return alias_val
+    # 매칭 안 되면 원본 반환
+    return cleaned
+
+
+def _safe_filename(text, max_len=40):
+    """파일명에 사용할 수 없는 문자 제거 및 길이 제한."""
+    if not text:
+        return "unknown"
+    safe = re.sub(r'[\\/:*?"<>|]', '_', str(text))
+    safe = re.sub(r'\s+', '_', safe)
+    safe = safe.strip('_')
+    return safe[:max_len] if safe else "unknown"
+
+
+# ==========================================
 # 3. 원본 그대로 — 유틸리티 함수들
 # ==========================================
 def read_excel_from_bytes(uploaded_file):
@@ -78,7 +148,7 @@ def read_excel_from_bytes(uploaded_file):
         cell = row[0]
         comp = row[2] if len(row) > 2 else None
         docid = str(cell.value).strip() if cell.value else ""
-        company = str(comp.value).strip() if comp and comp.value else ""
+        company = normalize_company(str(comp.value).strip()) if comp and comp.value else ""
         if not docid:
             continue
         if getattr(cell, "hyperlink", None) and cell.hyperlink.target:
@@ -471,7 +541,7 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
         if not tdoc_id:
             continue
 
-        company = str(company_cell.value or "").strip() if company_cell else ""
+        company = normalize_company(str(company_cell.value or "").strip()) if company_cell else ""
         agenda_desc = str(agenda_cell.value or "").strip() if agenda_cell else ""
         agenda_num = str(agenda_num_cell.value or "").strip() if agenda_num_cell else ""
 
@@ -524,12 +594,16 @@ def repackage_docm_to_docx(path, td):
     with zipfile.ZipFile(path, 'r') as zf:
         zf.extractall(ud)
     tf = os.path.join(ud, "[Content_Types].xml")
-    t = open(tf, 'r', encoding='utf-8').read()
+    if not os.path.exists(tf):
+        return path  # Content_Types.xml 없으면 원본 반환
+    with open(tf, 'r', encoding='utf-8') as f:
+        t = f.read()
     t = t.replace(
         'application/vnd.ms-word.document.macroEnabled.main+xml',
         'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'
     )
-    open(tf, 'w', encoding='utf-8').write(t)
+    with open(tf, 'w', encoding='utf-8') as f:
+        f.write(t)
     rp = os.path.join(td, "repack.zip")
     with zipfile.ZipFile(rp, 'w', zipfile.ZIP_DEFLATED) as zf:
         for r, _, fs in os.walk(ud):
@@ -614,13 +688,19 @@ def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
     od.add_heading("3GPP Conclusions", level=0)
     extracted_list = []
     total = len(entries)
+    if total == 0:
+        log_func("입력 문서 없음")
+        bio = io.BytesIO()
+        od.save(bio)
+        bio.seek(0)
+        return bio
     batch_size = 10
     all_results = []
 
     for i in range(0, total, batch_size):
         batch = entries[i:i + batch_size]
         status_elem.text(f"☁️ 클라우드 처리 [{min(i+batch_size, total)}/{total}]")
-        progress_elem.progress(min(i+batch_size, total) / total)
+        progress_elem.progress(min(i+batch_size, total) / max(total, 1))
         try:
             resp = requests.post(CLOUD_FUNCTION_URL, json={"entries": batch}, timeout=300)
             resp.raise_for_status()
@@ -681,12 +761,19 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
         extracted_list = []
         total = len(entries)
 
+        if total == 0:
+            log_func("입력 문서 없음")
+            bio = io.BytesIO()
+            od.save(bio)
+            bio.seek(0)
+            return bio
+
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(_download_doc, e, temp_dir, headers): e for e in entries}
             for i, fut in enumerate(as_completed(futures), start=1):
                 e, fp, err = fut.result()
                 download_results.append((e, fp, err))
-                progress_elem.progress(i / total)
+                progress_elem.progress(i / max(total, 1))
                 status_elem.text(f"Downloaded [{i}/{total}]: {e['doc']}")
                 log_func(f"[{i}/{total}] Downloaded: {e['doc']}")
 
@@ -972,6 +1059,11 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 [허용된 회사 목록]
 {', '.join(sorted(valid_companies))}
 
+주의: 다음 회사들은 같은 그룹이므로 하나의 회사로 취급하세요:
+- ZTE = Sanechips (같은 그룹)
+- Huawei = HiSilicon (같은 그룹)
+- Nokia = Nokia Shanghai Bell (같은 그룹)
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [그룹핑 규칙 — 정밀 그룹핑]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1100,9 +1192,13 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                 for attempt in range(5):
                     try:
                         res = model.generate_content(mp, generation_config=strict_config)
-                        if res and res.text:
-                            intermediate.append(res.text)
-                            batch_success = True
+                        try:
+                            if res and res.text and len(res.text.strip()) > 10:
+                                intermediate.append(res.text)
+                                batch_success = True
+                        except (ValueError, AttributeError):
+                            # Safety filter로 차단되거나 응답이 비정상인 경우
+                            append_log(f"배치 {i+1}: 응답 텍스트 접근 실패 (safety filter?)")
                         break
                     except Exception as e:
                         if "429" in str(e) or "503" in str(e):
@@ -1189,7 +1285,7 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
             )
             return False
 
-        if not hasattr(response, 'text') or not response.text:
+        if not hasattr(response, 'text'):
             st.error(
                 "❌ **API가 빈 응답을 반환했습니다.**\n\n"
                 "서버 과부하 또는 문서가 너무 많아 처리에 실패했습니다.\n\n"
@@ -1198,10 +1294,18 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
             )
             return False
 
-        status_elem.text("✅ AI 분석 완료! 결과 문서를 생성하고 있습니다...")
-        result_text = response.text
+        try:
+            result_text = response.text
+        except (ValueError, AttributeError) as e:
+            st.error(
+                "❌ **AI 응답이 안전 필터에 의해 차단되었습니다.**\n\n"
+                "기고문 내용이 AI 안전 정책에 의해 필터링되었을 수 있습니다.\n\n"
+                "**해결:** 다시 시도하거나 NotebookLM을 사용해 주세요."
+            )
+            append_log(f"Gemini safety filter: {e}")
+            return False
 
-        if len(result_text.strip()) < 50:
+        if not result_text or len(result_text.strip()) < 50:
             st.error(
                 "❌ **AI 응답이 너무 짧습니다.**\n\n"
                 "API 부하로 인해 불완전한 응답이 왔습니다.\n\n"
@@ -1209,6 +1313,8 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                 "자기만의 한도로 안정적으로 분석할 수 있습니다."
             )
             return False
+
+        status_elem.text("✅ AI 분석 완료! 결과 문서를 생성하고 있습니다...")
 
         # ★ 할루시네이션 후처리 검증 ★
         cited_docs = set(re.findall(r'[A-Z]\d?-\d{7}', result_text))
@@ -1434,7 +1540,7 @@ elif page == "🚀 통합 분석기":
                         st.session_state.all_entries = []
 
             if st.session_state.get("resolved_folder"):
-                st.caption(f"📂 `ftp/{WG_FTP_MAP[wg]}/{st.session_state['resolved_folder']}/Docs/`")
+                st.caption(f"📂 `ftp/{WG_FTP_MAP.get(wg, '')}/{st.session_state.get('resolved_folder', '')}/Docs/`")
 
         if st.session_state.agenda_dict:
             agenda_items = sorted(st.session_state.agenda_dict.keys())
@@ -1450,6 +1556,7 @@ elif page == "🚀 통합 분석기":
 
             if selected_agenda:
                 entries = st.session_state.agenda_dict[selected_agenda]
+                st.session_state["selected_agenda_name"] = selected_agenda
                 st.info(f"📄 **{selected_agenda}** — {len(entries)}개 문서가 분석 대상입니다.")
 
                 with st.expander(f"문서 목록 미리보기 ({len(entries)}개)", expanded=False):
@@ -1515,19 +1622,25 @@ elif page == "🚀 통합 분석기":
 
     if st.session_state.process_done:
         st.success("🎉 기본 분석 완료! Output 1·2를 다운로드하세요.")
+
+        # 파일명에 agenda 정보 포함
+        agenda_tag = _safe_filename(st.session_state.get("selected_agenda_name", ""), 30)
+        if not agenda_tag:
+            agenda_tag = "manual"
+
         col1, col2 = st.columns(2)
         with col1:
             if st.session_state.out1_bytes:
                 st.download_button("📥 Output 1 (Conclusions 취합.docx)",
                     data=st.session_state.out1_bytes,
-                    file_name="output1_conclusions.docx",
+                    file_name=f"output1_conclusions_{agenda_tag}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     use_container_width=True)
         with col2:
             if st.session_state.out2_bytes:
                 st.download_button("📥 Output 2 (TF-IDF 요약.docx)",
                     data=st.session_state.out2_bytes,
-                    file_name="output2_summary_tfidf.docx",
+                    file_name=f"output2_summary_tfidf_{agenda_tag}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     use_container_width=True)
 
@@ -1645,7 +1758,7 @@ elif page == "🚀 통합 분석기":
             st.download_button(
                 f"📥 Output 3 (AI 정밀 요약 - {st.session_state.ai_model_name}.docx)",
                 data=st.session_state.ai_summary_bytes,
-                file_name="Output3_AI_Summary.docx",
+                file_name=f"Output3_AI_Summary_{agenda_tag}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 type="primary", use_container_width=True)
             with st.expander("👀 AI 분석 결과 미리보기", expanded=True):
@@ -1674,7 +1787,7 @@ elif page == "🚀 통합 분석기":
                 st.download_button(
                     label="📝 NotebookLM 전용 텍스트(.txt) 다운로드",
                     data=st.session_state.notebooklm_txt.encode('utf-8'),
-                    file_name="NotebookLM_Input_Conclusions.txt",
+                    file_name=f"NotebookLM_Conclusions_{agenda_tag}.txt",
                     mime="text/plain",
                     type="primary",
                     use_container_width=True,
