@@ -907,6 +907,7 @@ def _build_doc_inventory(extracted_data):
 
 def run_gemini_analysis(extracted_data, status_elem, api_key):
     genai.configure(api_key=api_key)
+    _gemini_start_time = time.time()  # 전체 소요 시간 추적
 
     # 문서 인벤토리 (허용된 문서 번호 목록)
     doc_inventory = _build_doc_inventory(extracted_data)
@@ -1069,91 +1070,171 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                 batch_docs = ", ".join([it['doc'] for it in batch])
                 mp = MAP_PROMPT_TEMPLATE.format(doc_list=batch_docs, batch_text=bt)
 
-                for attempt in range(3):
+                batch_success = False
+                for attempt in range(5):
                     try:
                         res = model.generate_content(mp, generation_config=strict_config)
-                        if res and res.text: intermediate.append(res.text)
+                        if res and res.text:
+                            intermediate.append(res.text)
+                            batch_success = True
                         break
                     except Exception as e:
                         if "429" in str(e) or "503" in str(e):
-                            for cd in range(60,0,-1):
-                                status_elem.text(f"⚠️ API 대기 {cd}초 ({attempt+1}/3)")
+                            wait = 60 * (attempt + 1)
+                            elapsed = int(time.time() - _gemini_start_time)
+                            if elapsed > 600:  # 10분 초과
+                                status_elem.text(
+                                    f"⚠️ {elapsed//60}분 경과 — API 과부하가 심합니다. "
+                                    f"'내 개인 API 키'를 사용하면 즉시 분석 가능합니다."
+                                )
+                            for cd in range(wait,0,-1):
+                                elapsed = int(time.time() - _gemini_start_time)
+                                status_elem.text(
+                                    f"⚠️ API 과부하 대기 {cd}초 (시도 {attempt+1}/5, "
+                                    f"총 {elapsed//60}분 {elapsed%60}초 경과)"
+                                )
                                 time.sleep(1)
                         else: raise
+
+                if not batch_success:
+                    append_log(f"배치 {i+1} 실패 (5회 재시도 소진)")
+
                 if i < total_batches-1:
                     for cd in range(5,0,-1):
-                        status_elem.text(f"⏳ 대기 {cd}초 ({i+1}/{total_batches} 완료)")
+                        status_elem.text(f"⏳ 배치 간 대기 {cd}초 ({i+1}/{total_batches} 완료)")
                         time.sleep(1)
 
-            status_elem.text("🧠 최종 병합 분석 중...")
+            if not intermediate:
+                elapsed = int(time.time() - _gemini_start_time)
+                st.error(
+                    f"❌ **{elapsed//60}분 동안 시도했으나 결과를 받지 못했습니다.**\n\n"
+                    f"동시 사용자가 많아 서버 기본 API 한도가 소진된 상태입니다.\n\n"
+                    f"**해결 방법:** 위에서 **'🔐 내 개인 Gemini API 키 사용'**을 선택하세요. "
+                    f"1분이면 무료 발급 가능하고, 자기만의 한도로 바로 분석됩니다."
+                )
+                return False
+
+            status_elem.text("🧠 최종 병합 분석 중... (가장 오래 걸리는 단계입니다)")
             fi = "\n\n=== 배치 구분 ===\n\n".join(intermediate)
             rp = REDUCE_PROMPT_TEMPLATE.format(
                 doc_list=doc_list_str,
                 company_list=company_list_str,
                 intermediate_text=fi,
             )
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     response = model.generate_content(rp, generation_config=strict_config); break
                 except Exception as e:
                     if "429" in str(e) or "503" in str(e):
-                        for cd in range(60,0,-1):
-                            status_elem.text(f"⚠️ 대기 {cd}초 ({attempt+1}/3)"); time.sleep(1)
+                        wait = 60 * (attempt + 1)
+                        for cd in range(wait,0,-1):
+                            elapsed = int(time.time() - _gemini_start_time)
+                            status_elem.text(f"⚠️ 최종 병합 대기 {cd}초 (시도 {attempt+1}/5, 총 {elapsed//60}분 {elapsed%60}초 경과)"); time.sleep(1)
                     else: raise
         else:
             # Direct analysis
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     response = model.generate_content(MAIN_PROMPT, generation_config=strict_config); break
                 except Exception as e:
                     if "429" in str(e) or "503" in str(e):
-                        for cd in range(30,0,-1):
-                            status_elem.text(f"⚠️ 대기 {cd}초 ({attempt+1}/3)"); time.sleep(1)
+                        wait = 60 * (attempt + 1)
+                        elapsed = int(time.time() - _gemini_start_time)
+                        if elapsed > 600:
+                            status_elem.text(
+                                f"⚠️ {elapsed//60}분 경과 — '내 개인 API 키'를 사용하면 즉시 분석 가능합니다."
+                            )
+                            time.sleep(3)
+                        for cd in range(wait,0,-1):
+                            elapsed = int(time.time() - _gemini_start_time)
+                            status_elem.text(f"⚠️ API 대기 {cd}초 (시도 {attempt+1}/5, 총 {elapsed//60}분 {elapsed%60}초 경과)"); time.sleep(1)
                     else: raise
 
-        status_elem.text("✅ AI 분석 완료!")
-        if response and response.text:
-            result_text = response.text
+        status_elem.text("🔍 응답 확인 중...")
 
-            # ★ 할루시네이션 후처리 검증 ★
-            # 결과에서 인용된 문서 번호가 실제 다운로드 목록에 있는지 체크
-            cited_docs = set(re.findall(r'[A-Z]\d?-\d{7}', result_text))
-            hallucinated = cited_docs - valid_doc_ids
-            if hallucinated:
-                result_text += f"\n\n---\n⚠️ **검증 경고:** 다음 문서 번호는 다운로드된 파일 목록에 없습니다 (할루시네이션 가능성): {', '.join(sorted(hallucinated))}"
+        # response 검증
+        if response is None:
+            st.error(
+                "❌ **API 응답을 받지 못했습니다.**\n\n"
+                "동시 사용자가 너무 많아 서버 기본 API의 한도가 소진된 상태입니다.\n\n"
+                "**해결 방법:** 위에서 **'🔐 내 개인 Gemini API 키 사용'**을 선택하고, "
+                "개인 무료 API 키를 입력하면 자기만의 한도로 바로 분석할 수 있습니다. "
+                "(발급 가이드가 화면에 표시됩니다)"
+            )
+            return False
 
-            # Output 3 docx 생성
-            doc = Document()
-            doc.add_heading(f"AI 정밀 분석 요약 ({model_display})", 0)
-            doc.add_paragraph(f"분석 대상: {total_docs}개 문서")
-            doc.add_paragraph(f"분석 모델: {model_display} (temperature=0.0)")
-            doc.add_paragraph("")
-            for line in result_text.split('\n'):
-                if re.match(r'^(#+)?\s*\d+\.|^###', line.strip()):
-                    p = doc.add_paragraph()
-                    p.add_run(line.replace('#','').strip()).bold = True
-                elif line.strip().startswith('* **'):
-                    doc.add_paragraph(line.strip())
-                elif line.strip().startswith('- [') or line.strip().startswith('- '):
-                    doc.add_paragraph(line.strip())
-                else:
-                    doc.add_paragraph(line)
-            bio = io.BytesIO()
-            doc.save(bio)
-            st.session_state.ai_summary_bytes = bio.getvalue()
-            st.session_state.ai_summary_text = result_text
-            st.session_state.ai_model_name = model_display
-            st.session_state.ai_summary_generated = True
-            return True
+        if not hasattr(response, 'text') or not response.text:
+            st.error(
+                "❌ **API가 빈 응답을 반환했습니다.**\n\n"
+                "서버 과부하 또는 문서가 너무 많아 처리에 실패했습니다.\n\n"
+                "**해결 방법:** '🔐 내 개인 Gemini API 키 사용'으로 전환하거나, "
+                "분석할 문서 수를 줄여서 다시 시도해 주세요."
+            )
+            return False
+
+        status_elem.text("✅ AI 분석 완료! 결과 문서를 생성하고 있습니다...")
+        result_text = response.text
+
+        if len(result_text.strip()) < 50:
+            st.error(
+                "❌ **AI 응답이 너무 짧습니다.**\n\n"
+                "API 부하로 인해 불완전한 응답이 왔습니다.\n\n"
+                "**해결 방법:** '🔐 내 개인 Gemini API 키 사용'으로 전환하면 "
+                "자기만의 한도로 안정적으로 분석할 수 있습니다."
+            )
+            return False
+
+        # ★ 할루시네이션 후처리 검증 ★
+        cited_docs = set(re.findall(r'[A-Z]\d?-\d{7}', result_text))
+        hallucinated = cited_docs - valid_doc_ids
+        if hallucinated:
+            result_text += f"\n\n---\n⚠️ **검증 경고:** 다음 문서 번호는 다운로드된 파일 목록에 없습니다 (할루시네이션 가능성): {', '.join(sorted(hallucinated))}"
+
+        # Output 3 docx 생성
+        doc = Document()
+        doc.add_heading(f"AI 정밀 분석 요약 ({model_display})", 0)
+        doc.add_paragraph(f"분석 대상: {total_docs}개 문서")
+        doc.add_paragraph(f"분석 모델: {model_display} (temperature=0.0)")
+        doc.add_paragraph("")
+        for line in result_text.split('\n'):
+            if re.match(r'^(#+)?\s*\d+\.|^###', line.strip()):
+                p = doc.add_paragraph()
+                p.add_run(line.replace('#','').strip()).bold = True
+            elif line.strip().startswith('* **'):
+                doc.add_paragraph(line.strip())
+            elif line.strip().startswith('- [') or line.strip().startswith('- '):
+                doc.add_paragraph(line.strip())
+            else:
+                doc.add_paragraph(line)
+        bio = io.BytesIO()
+        doc.save(bio)
+        st.session_state.ai_summary_bytes = bio.getvalue()
+        st.session_state.ai_summary_text = result_text
+        st.session_state.ai_model_name = model_display
+        st.session_state.ai_summary_generated = True
+        status_elem.text("✅ 완료! 아래에서 결과를 확인하세요.")
+        st.rerun()
+
     except Exception as e:
         err = str(e)
         # ★ 보안: 에러 메시지에서 API 키가 노출되지 않도록 필터링
         if GEMINI_API_KEY and GEMINI_API_KEY in err:
             err = err.replace(GEMINI_API_KEY, "***HIDDEN***")
-        if "429" in err or "Quota" in err:
-            st.error("❌ API 용량 초과. 잠시 후 다시 시도하세요.")
+        if api_key_to_use and api_key_to_use in err:
+            err = err.replace(api_key_to_use, "***HIDDEN***")
+        if "429" in err or "Quota" in err or "exhausted" in err.lower():
+            st.error(
+                "❌ **API 용량이 완전히 소진되었습니다.**\n\n"
+                "현재 서버 기본 API의 일일 한도가 초과되었거나, 동시 사용자가 너무 많습니다.\n\n"
+                "**해결 방법:** 위에서 **'🔐 내 개인 Gemini API 키 사용'**을 선택하세요. "
+                "개인 무료 API 키를 발급받으면 (1분 소요, 완전 무료) "
+                "자기만의 한도(일 1,500회)로 바로 분석할 수 있습니다."
+            )
         else:
-            st.error(f"❌ API 오류가 발생했습니다. 관리자에게 문의하세요.")
+            st.error(
+                f"❌ **API 오류가 발생했습니다.**\n\n"
+                f"잠시 후 다시 시도하거나, '내 개인 API 키'를 사용해 보세요."
+            )
             append_log(f"Gemini error (sanitized): {err[:200]}")
     return False
 
@@ -1423,6 +1504,8 @@ elif page == "🚀 통합 분석기":
                 api_key_to_use = personal_key.strip()
 
         if api_key_to_use:
+            st.markdown("")
+            st.markdown("#### 👇 준비가 되었으면 아래 버튼을 클릭하세요")
             if st.button("✨ Gemini AI 정밀 분석 시작", use_container_width=True, type="primary"):
                 gemini_container = st.container()
                 with gemini_container:
