@@ -380,8 +380,19 @@ def resolve_meeting_folder(wg, meeting_num):
                 if normalize_bis(normalized_folder).startswith(normalize_bis(normalized_suffix)):
                     found.append(name)
             else:
-                # suffix 없으면 (순수 숫자) 정확히 숫자만 매칭
-                if folder_rest == "" or folder_rest.startswith("_") or folder_rest.startswith("/"):
+                # suffix 없으면 (순수 숫자 입력, 예: "156")
+                # ✅ 매칭: TSGS2_156 (뒤에 아무것도 없음)
+                # ✅ 매칭: TSGS2_156_Toulouse (뒤에 _도시명)
+                # ✅ 매칭: TSGS2_156E_Electronic (뒤에 E=electronic)
+                # ✅ 매칭: TSGS2_156AH_xxx (뒤에 AH=ad hoc)
+                # ❌ 불매칭: TSGS2_156b_xxx (b는 별도 회의 번호)
+                # ❌ 불매칭: TSGS2_156c_xxx (c도 별도 회의 번호)
+                # ❌ 불매칭: TSGS2_156bis_xxx (bis도 별도)
+                if (folder_rest == "" or
+                    folder_rest.startswith("_") or
+                    folder_rest.startswith("/") or
+                    re.match(r'^(e|ah|ahe?)[\W_]', folder_rest, re.I) or
+                    re.match(r'^(e|ah|ahe?)$', folder_rest, re.I)):
                     found.append(name)
 
         if found:
