@@ -750,11 +750,21 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
         od.add_heading("3GPP Conclusions", level=0)
 
         cps = [
+            # "3. Conclusion", "Conclusions", "3 Conclusions"
             re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(conclusions?)\s*$", re.I),
+            # "Conclusion and proposals", "Conclusions and Observations"
+            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(conclusions?\s+and\s+\w+)", re.I),
+            # "Summary", "3. Summary"
             re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(summary)\s*$", re.I),
+            # "Summary and proposal", "Summary and observations"
+            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(summary\s+and\s+\w+)", re.I),
+            # "xxx summary" — e.g. "SIB design summary", "Overall summary"
+            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(\w+\s+)?summary\s*$", re.I),
+            # "Proposals" (단독 섹션)
+            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(proposals?)\s*$", re.I),
         ]
         eps = [
-            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(references?|appendix|acknowledgment)\s*$", re.I),
+            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(references?|appendix|acknowledgment|annex)\s*", re.I),
         ]
         headers = {"User-Agent": "Mozilla/5.0"}
         download_results = []
@@ -801,12 +811,60 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     src_path = next(Path(ed).rglob(ext), None)
                     if src_path: break
 
+                # PDF fallback
                 if not src_path:
-                    od.add_paragraph("DOC 파일을 찾을 수 없습니다.")
+                    src_path = next(Path(ed).rglob("*.pdf"), None)
+
+                if not src_path:
+                    od.add_paragraph("DOC/PDF 파일을 찾을 수 없습니다.")
                     log_func(f"{e['doc']} 없음")
                     continue
 
                 file_path_str = str(src_path)
+
+                # .doc (구형 바이너리) 파일 처리 — python-docx로 열 수 없음
+                if src_path.suffix.lower() == ".doc":
+                    try:
+                        # 바이너리에서 텍스트 추출 시도 (완벽하지 않지만 Proposal/Conclusion 키워드 포착 가능)
+                        with open(file_path_str, "rb") as bf:
+                            raw = bf.read()
+                        # .doc에서 ASCII 텍스트 추출
+                        text_chunks = re.findall(rb'[\x20-\x7E]{20,}', raw)
+                        raw_text = "\n".join(chunk.decode('ascii', errors='ignore') for chunk in text_chunks)
+                        if raw_text:
+                            od.add_paragraph(f"[구형 .doc — 텍스트 추출 (서식 없음)]")
+                            # Conclusion/Summary 부분 찾기
+                            lines = raw_text.split('\n')
+                            found_conclusion = False
+                            for li, line in enumerate(lines):
+                                if re.search(r'(?:conclusion|summary)', line, re.I):
+                                    found_conclusion = True
+                                    for cl in lines[li:li+30]:
+                                        od.add_paragraph(cl)
+                                        doc_text_buffer.append(cl)
+                                    break
+                            if not found_conclusion:
+                                od.add_paragraph("결론 섹션 없음 (구형 .doc)")
+                                # 전체 텍스트 일부 추출
+                                for cl in lines[-20:]:
+                                    doc_text_buffer.append(cl)
+                            extracted_list.append({
+                                "doc": e["doc"], "company": e["company"], "link": e["link"],
+                                "title": "(구형 .doc)",
+                                "content": "\n".join(doc_text_buffer) if doc_text_buffer else "텍스트 추출 실패",
+                                "full_content": raw_text[:5000]
+                            })
+                            log_func(f"{e['doc']} .doc 텍스트 추출")
+                        else:
+                            od.add_paragraph("구형 .doc 파일에서 텍스트를 추출할 수 없습니다.")
+                            log_func(f"{e['doc']} .doc 텍스트 추출 실패")
+                    except Exception as ex:
+                        od.add_paragraph(f"구형 .doc 파일 처리 오류: {ex}")
+                        log_func(f"{e['doc']} .doc 오류: {ex}")
+                    if idx < len(download_results):
+                        od.add_page_break()
+                    continue
+
                 if src_path.suffix.lower() == ".docm":
                     try:
                         file_path_str = repackage_docm_to_docx(file_path_str, temp_dir)
