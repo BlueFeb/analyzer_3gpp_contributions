@@ -899,8 +899,88 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         title = t.split(":", 1)[1].strip()
                 if not title:
                     title = sd.core_properties.title or ""
+
+                # ★ CR (Change Request) 감지 ★
+                # CR 문서는 첫 번째 테이블에 "CHANGE REQUEST" 또는 "CR-Form" 텍스트가 있음
+                is_cr = False
+                cr_reason = ""
+                cr_summary = ""
+                cr_title = ""
+                try:
+                    for tbl_idx, doc_tbl in enumerate(sd.tables[:3]):  # 처음 3개 테이블만 체크
+                        for row in doc_tbl.rows:
+                            row_text = " ".join(cell.text.strip() for cell in row.cells).lower()
+                            if "change request" in row_text or "cr-form" in row_text:
+                                is_cr = True
+                                break
+                        if is_cr:
+                            break
+
+                    if is_cr:
+                        # CR 테이블에서 Title, Reason for change, Summary of change 추출
+                        for doc_tbl in sd.tables[:3]:
+                            for row in doc_tbl.rows:
+                                cells = [cell.text.strip() for cell in row.cells]
+                                cells_lower = [c.lower() for c in cells]
+                                row_joined = " ".join(cells_lower)
+
+                                # Title 추출 (보통 Table 2, Row 1)
+                                if "title:" in cells_lower[0] and not cr_title:
+                                    # 두 번째 셀 이후에 제목이 있음
+                                    for c in cells[1:]:
+                                        if c and c != cells[0]:
+                                            cr_title = c
+                                            break
+
+                                # Reason for change
+                                if "reason for change" in row_joined:
+                                    for c in cells:
+                                        if c.lower() not in ("", "reason for change:", "reason for change"):
+                                            cr_reason = c
+                                            break
+
+                                # Summary of change
+                                if "summary of change" in row_joined:
+                                    for c in cells:
+                                        if c.lower() not in ("", "summary of change:", "summary of change"):
+                                            cr_summary = c
+                                            break
+
+                        if cr_title and not title:
+                            title = cr_title
+                except Exception:
+                    pass  # 테이블 파싱 실패해도 일반 문서로 계속 진행
+
                 tbl.cell(3, 1).text = title
 
+                # CR 문서 처리
+                if is_cr:
+                    od.add_paragraph("📋 [CR — Change Request 문서]").runs[0].bold = True
+                    if cr_reason:
+                        p_label = od.add_paragraph("")
+                        p_label.add_run("Reason for change: ").bold = True
+                        od.add_paragraph(cr_reason)
+                        doc_text_buffer.append(f"Reason for change: {cr_reason}")
+                    if cr_summary:
+                        p_label = od.add_paragraph("")
+                        p_label.add_run("Summary of change: ").bold = True
+                        od.add_paragraph(cr_summary)
+                        doc_text_buffer.append(f"Summary of change: {cr_summary}")
+                    if not cr_reason and not cr_summary:
+                        od.add_paragraph("CR 테이블에서 Reason/Summary를 추출하지 못했습니다.")
+                    log_func(f"{e['doc']} CR 문서 추출 완료")
+
+                    extracted_list.append({
+                        "doc": e["doc"], "company": e["company"], "link": e["link"],
+                        "title": title, "is_cr": True,
+                        "content": "\n".join(doc_text_buffer) if doc_text_buffer else "CR 내용 추출 실패",
+                        "full_content": "\n".join(full_text_buffer) if full_text_buffer else ""
+                    })
+                    if idx < len(download_results):
+                        od.add_page_break()
+                    continue
+
+                # ★ 일반 문서 — Conclusion/Summary 섹션 검색 ★
                 start = None
                 for pat in cps:
                     for j, p in enumerate(paras):
