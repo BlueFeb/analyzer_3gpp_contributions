@@ -818,17 +818,13 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     zf.extractall(ed)
 
                 src_path = None
-                for ext in ("*.docx", "*.docm", "*.doc"):
+                for ext in ("*.docx", "*.docm", "*.doc", "*.pptx", "*.ppt", "*.pdf"):
                     src_path = next(Path(ed).rglob(ext), None)
                     if src_path: break
 
-                # PDF fallback
                 if not src_path:
-                    src_path = next(Path(ed).rglob("*.pdf"), None)
-
-                if not src_path:
-                    od.add_paragraph("DOC/PDF 파일을 찾을 수 없습니다.")
-                    log_func(f"{e['doc']} 없음")
+                    od.add_paragraph("문서 파일을 찾을 수 없습니다 (docx/doc/ppt/pdf).")
+                    log_func(f"{e['doc']} 파일 없음")
                     continue
 
                 file_path_str = str(src_path)
@@ -872,6 +868,81 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     except Exception as ex:
                         od.add_paragraph(f"구형 .doc 파일 처리 오류: {ex}")
                         log_func(f"{e['doc']} .doc 오류: {ex}")
+                    if idx < len(download_results):
+                        od.add_page_break()
+                    continue
+
+                # .pptx/.ppt 파일 처리
+                if src_path.suffix.lower() in (".pptx", ".ppt"):
+                    try:
+                        from pptx import Presentation
+                        prs = Presentation(file_path_str)
+                        texts = []
+                        for slide in prs.slides:
+                            for shape in slide.shapes:
+                                if hasattr(shape, "text") and shape.text.strip():
+                                    texts.append(shape.text.strip())
+                        ppt_text = "\n".join(texts)
+                        od.add_paragraph(f"[PPT 문서 — 슬라이드 텍스트 추출]")
+                        for line in ppt_text.split('\n')[:50]:
+                            if line.strip():
+                                od.add_paragraph(line.strip())
+                                doc_text_buffer.append(line.strip())
+                        extracted_list.append({
+                            "doc": e["doc"], "company": e["company"], "link": e["link"],
+                            "title": "(PPT)", "content": ppt_text[:5000],
+                            "full_content": ppt_text
+                        })
+                        log_func(f"{e['doc']} PPT 추출 완료")
+                    except ImportError:
+                        od.add_paragraph("PPT 파싱 라이브러리 없음 (python-pptx)")
+                    except Exception as ex:
+                        od.add_paragraph(f"PPT 처리 오류: {ex}")
+                        log_func(f"{e['doc']} PPT 오류: {ex}")
+                    if idx < len(download_results):
+                        od.add_page_break()
+                    continue
+
+                # .pdf 파일 처리
+                if src_path.suffix.lower() == ".pdf":
+                    try:
+                        import fitz  # PyMuPDF
+                        pdf_doc = fitz.open(file_path_str)
+                        pdf_texts = [page.get_text() for page in pdf_doc]
+                        pdf_doc.close()
+                        pdf_text = "\n".join(pdf_texts)
+                        od.add_paragraph(f"[PDF 문서 — 텍스트 추출]")
+                        for line in pdf_text.split('\n')[:50]:
+                            if line.strip():
+                                od.add_paragraph(line.strip())
+                                doc_text_buffer.append(line.strip())
+                        extracted_list.append({
+                            "doc": e["doc"], "company": e["company"], "link": e["link"],
+                            "title": "(PDF)", "content": pdf_text[:5000],
+                            "full_content": pdf_text
+                        })
+                        log_func(f"{e['doc']} PDF 추출 완료")
+                    except ImportError:
+                        # PyMuPDF 없으면 바이너리 텍스트 추출
+                        try:
+                            with open(file_path_str, "rb") as bf:
+                                raw = bf.read()
+                            text_chunks = re.findall(rb'[\x20-\x7E]{20,}', raw)
+                            raw_text = "\n".join(c.decode('ascii', errors='ignore') for c in text_chunks)
+                            od.add_paragraph("[PDF — 기본 텍스트 추출]")
+                            for line in raw_text.split('\n')[:30]:
+                                od.add_paragraph(line)
+                                doc_text_buffer.append(line)
+                            extracted_list.append({
+                                "doc": e["doc"], "company": e["company"], "link": e["link"],
+                                "title": "(PDF)", "content": raw_text[:3000],
+                                "full_content": raw_text
+                            })
+                        except Exception as ex:
+                            od.add_paragraph(f"PDF 텍스트 추출 실패: {ex}")
+                    except Exception as ex:
+                        od.add_paragraph(f"PDF 처리 오류: {ex}")
+                        log_func(f"{e['doc']} PDF 오류: {ex}")
                     if idx < len(download_results):
                         od.add_page_break()
                     continue
@@ -1163,6 +1234,10 @@ def _build_doc_inventory(extracted_data):
 
 
 def run_gemini_analysis(extracted_data, status_elem, api_key):
+    if not extracted_data:
+        st.warning("⚠️ 분석할 문서가 없습니다.")
+        return False
+
     genai.configure(api_key=api_key)
     _gemini_start_time = time.time()  # 전체 소요 시간 추적
 
@@ -1501,8 +1576,8 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
         # ★ 보안: 에러 메시지에서 API 키가 노출되지 않도록 필터링
         if GEMINI_API_KEY and GEMINI_API_KEY in err:
             err = err.replace(GEMINI_API_KEY, "***HIDDEN***")
-        if api_key_to_use and api_key_to_use in err:
-            err = err.replace(api_key_to_use, "***HIDDEN***")
+        if api_key and api_key in err:
+            err = err.replace(api_key, "***HIDDEN***")
         if "429" in err or "Quota" in err or "exhausted" in err.lower():
             st.error(
                 "❌ **API 용량이 완전히 소진되었습니다.**\n\n"
@@ -1633,6 +1708,25 @@ elif page == "🚀 통합 분석기":
     st.title("🚀 3GPP 기고문 통합 분석기")
     st.caption("Output 1·2는 기본 | Output 3 Gemini는 선택")
 
+    with st.expander("🆕 v2.1 업데이트 안내", expanded=True):
+        st.markdown("""
+**CR (Change Request) 문서 자동 인식**
+- CR 문서를 자동 감지하여 **Reason for change**, **Summary of change**를 추출합니다.
+- Output 1에 `📋 [CR — Change Request 문서]` 레이블이 표시됩니다.
+
+**다양한 문서 형식 지원**
+- `.docx`, `.docm` — 서식 포함 추출
+- `.doc` (구형 Word) — 텍스트 추출
+- `.pptx`, `.ppt` — 슬라이드 텍스트 추출
+- `.pdf` — PDF 텍스트 추출
+
+**Conclusion 패턴 확장**
+- "Conclusion and proposals", "Summary and proposal", "SIB design summary" 등 다양한 변형 인식
+
+**회사명 자동 통합**
+- ZTE = Sanechips, Huawei = HiSilicon, Nokia = Nokia Shanghai Bell 등 동일 그룹 자동 통합
+        """)
+
     # Step 1: Input
     st.header("1️⃣ 데이터 입력")
     if CLOUD_FUNCTION_URL:
@@ -1653,13 +1747,14 @@ elif page == "🚀 통합 분석기":
 
         with col_num:
             meeting_num_input = st.text_input(
-                "회의 번호 입력 (예: 133bis, 122, 168):",
+                "회의 번호 입력 후 Enter ↵ (예: 133bis, 122, 168):",
                 placeholder="133bis",
-                help="3GPP 회의 번호만 입력. 예: RAN2#133bis → '133bis' 입력"
+                help="3GPP 회의 번호만 입력 후 Enter를 누르세요. 예: RAN2#133bis → '133bis' 입력"
             )
 
         if meeting_num_input and meeting_num_input.strip():
             meeting_num = meeting_num_input.strip()
+            st.info("✅ 회의 번호 입력 완료 — 아래 **Agenda 불러오기** 버튼을 클릭하세요.")
 
             if st.button("📋 Agenda 불러오기", type="primary"):
                 with st.spinner(f"{wg}#{meeting_num} 폴더 검색 및 TDoc 리스트 다운로드 중... (3GPP 서버가 느릴 수 있습니다)"):
@@ -1886,7 +1981,9 @@ elif page == "🚀 통합 분석기":
                     gemini_detail = st.empty()
 
                     total_docs = len(st.session_state.extracted_data)
-                    if total_docs > 20:
+                    if total_docs == 0:
+                        st.warning("⚠️ 추출된 문서가 없습니다. 먼저 기본 분석을 실행하세요.")
+                    elif total_docs > 20:
                         total_batches = (total_docs + 19) // 20
                         gemini_detail.caption(
                             f"📋 {total_docs}개 문서를 {total_batches}개 그룹으로 나누어 분석합니다. "
@@ -1899,7 +1996,8 @@ elif page == "🚀 통합 분석기":
                             f"끝날 때까지 이 페이지를 닫지 마세요."
                         )
 
-                    run_gemini_analysis(st.session_state.extracted_data, gemini_status, api_key_to_use)
+                    if total_docs > 0:
+                        run_gemini_analysis(st.session_state.extracted_data, gemini_status, api_key_to_use)
 
         # Gemini 결과 표시
         if st.session_state.ai_summary_generated:
