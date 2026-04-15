@@ -1096,13 +1096,21 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
 
 
 def _build_notebooklm_txt(extracted_list):
-    txt = ["=== 3GPP Contributions Conclusions ==="]
+    txt = ["=== 3GPP Contributions Analysis Input ==="]
     for item in extracted_list:
-        txt.append(f"\n\n--- Document: {item['doc']} ---")
-        txt.append(f"Company: {item['company']}")
-        txt.append(f"Title: {item['title']}")
-        txt.append("Content:")
-        txt.append(item['content'])
+        doc_type = "[CR]" if item.get("is_cr") else "[기고문]"
+        txt.append(f"\n\n{'='*50}")
+        txt.append(f"문서번호: {item['doc']}  {doc_type}")
+        txt.append(f"회사: {item['company']}")
+        txt.append(f"제목: {item['title']}")
+        txt.append(f"{'='*50}")
+        # CR이면 content에 Reason/Summary가 들어있고, 일반이면 Conclusion
+        txt.append(item.get('content', ''))
+        # full_content가 있으면 추가 (더 상세한 분석 가능)
+        full = item.get('full_content', '')
+        if full and full != item.get('content', ''):
+            txt.append(f"\n--- 원문 전체 ---")
+            txt.append(full[:5000])
     st.session_state.notebooklm_txt = "\n".join(txt)
 
 
@@ -1141,7 +1149,9 @@ def parse_and_summarize(in_bio, status_elem, log_func):
         elif el.tag.endswith("p"):
             p = Paragraph(el, d)
             txt = p.text.strip()
-            if txt.lower().startswith("proposal"):
+            is_target = (txt.lower().startswith("proposal") or
+                        txt.lower().startswith("summary of change"))
+            if is_target:
                 buf, cm = [txt], {cur} if cur else set()
                 idx2 = d.element.body.index(el) + 1
                 while idx2 < len(d.element.body):
@@ -1149,7 +1159,10 @@ def parse_and_summarize(in_bio, status_elem, log_func):
                     if not sib.tag.endswith("p"): break
                     sp = Paragraph(sib, d)
                     st_text = sp.text.rstrip()
-                    if not st_text.strip() or st_text.lower().startswith("proposal"): break
+                    if not st_text.strip(): break
+                    if (st_text.lower().startswith("proposal") or
+                        st_text.lower().startswith("summary of change") or
+                        st_text.lower().startswith("reason for change")): break
                     buf.append(st_text)
                     if cur: cm.add(cur)
                     idx2 += 1
@@ -1309,6 +1322,9 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 3. 1개 회사만 단독 주장한 제안은 결과에서 제외하세요.
    반드시 2개 이상의 서로 다른 회사가 동일/유사 제안을 한 경우만 포함하세요.
 
+4. CR(Change Request) 문서의 경우, "Summary of change" 내용을 해당 회사의 제안으로 취급하세요.
+   다른 회사의 일반 기고문 Proposal과 동일/유사한 변경 내용이 있으면 같은 그룹으로 묶으세요.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [출력 양식] — 반드시 아래 형식을 정확히 따르세요
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1364,6 +1380,7 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 2. 같은 주제라도 제안 방향이 다르면 별도 그룹입니다.
 3. "에너지 효율" 같은 광범위한 그룹은 금지. "Cell DTX/DRX 패턴 정보를 UE에 전달" 수준으로 구체화.
 4. 2개 이상의 회사가 지지하는 제안만 포함하세요.
+5. CR(Change Request) 문서의 "Summary of change"도 제안으로 취급하여 그룹핑에 포함하세요.
 
 [출력 양식]
 ### [순위]. [제안의 구체적 동작 요약 제목]
@@ -1710,21 +1727,8 @@ elif page == "🚀 통합 분석기":
 
     with st.expander("🆕 v2.1 업데이트 안내", expanded=True):
         st.markdown("""
-**CR (Change Request) 문서 자동 인식**
-- CR 문서를 자동 감지하여 **Reason for change**, **Summary of change**를 추출합니다.
-- Output 1에 `📋 [CR — Change Request 문서]` 레이블이 표시됩니다.
-
-**다양한 문서 형식 지원**
-- `.docx`, `.docm` — 서식 포함 추출
-- `.doc` (구형 Word) — 텍스트 추출
-- `.pptx`, `.ppt` — 슬라이드 텍스트 추출
-- `.pdf` — PDF 텍스트 추출
-
-**Conclusion 패턴 확장**
-- "Conclusion and proposals", "Summary and proposal", "SIB design summary" 등 다양한 변형 인식
-
-**회사명 자동 통합**
-- ZTE = Sanechips, Huawei = HiSilicon, Nokia = Nokia Shanghai Bell 등 동일 그룹 자동 통합
+- **CR (Change Request) 자동 인식** — Reason for change, Summary of change 추출 및 AI 분석에 반영
+- **다양한 문서 형식** — `.docx`, `.doc`, `.pptx`, `.pdf` 모두 지원
         """)
 
     # Step 1: Input
@@ -2056,19 +2060,25 @@ elif page == "🚀 통합 분석기":
         st.markdown("4. 화면 하단 채팅창에 아래의 **구조화된 누락 방지 전문가용 프롬프트**를 복사하여 붙여넣고 전송(Enter)하면 완벽한 포맷의 요약이 도출됩니다!")
 
         notebooklm_prompt = """당신은 3GPP 표준화 회의의 전문 기술 분석가입니다.
-제공된 모든 기고문 전체 원문 모음을 꼼꼼히 검토하고, 아래의 [분석 지침]과 [출력 양식]을 엄격하게 준수하여 분석 보고서를 작성해 주세요.
+제공된 모든 기고문 원문을 꼼꼼히 검토하고, 아래의 [분석 지침]과 [출력 양식]을 엄격하게 준수하여 분석 보고서를 작성해 주세요.
 
 [분석 지침]
-1. 필터링: 반드시 "2개 이상의 회사"가 공통으로 지지하거나 유사한 기술적 주장을 하는 제안(Proposal)만 추출하세요. (1개 회사만 단독으로 주장한 내용은 완전히 제외합니다.)
-2. 그룹화: 단어 형태가 달라도 '기술적 핵심 의미와 목적'이 동일하다면 하나의 그룹으로 묶어주세요.
-3. 정렬: 지지하는 회사 수가 가장 많은 제안 그룹부터 '내림차순'으로, 2개 이상의 회사가 지지하는 제안(proposal)들을 모두 정렬하세요.
-4. 제약사항: 오직 제공된 소스 문서에 명시된 내용, 회사명, 문서 번호만 사용하고, 절대 외부 지식을 섞거나 지어내지 마세요. 환각(Hallucination)을 엄격히 금지합니다.
+1. 필터링: "2개 이상의 회사"가 공통으로 지지하거나 유사한 기술적 주장을 하는 제안(Proposal)만 추출하세요. 1개 회사만 단독 주장한 내용은 제외합니다.
+2. CR(Change Request) 문서: "Summary of change" 내용을 해당 회사의 제안으로 취급하세요. 다른 회사의 Proposal과 동일/유사한 변경 내용이면 같은 그룹으로 묶으세요.
+3. 그룹화: 단어 형태가 달라도 '기술적 핵심 의미와 목적'이 동일하면 하나의 그룹으로 묶되, 뭉뚱그리지 마세요. "에너지 효율" 같은 광범위한 그룹은 금지. "Cell DTX/DRX 패턴 정보를 UE에 전달" 수준으로 구체화하세요.
+4. 같은 주제라도 제안 방향이 다르면 별도 그룹입니다. (예: "WUS 필요하다" vs "WUS 불필요하다"는 별도 그룹)
+5. 정렬: 지지 회사 수가 가장 많은 그룹부터 내림차순 정렬.
+6. 회사 그룹 통합: ZTE=Sanechips, Huawei=HiSilicon, Nokia=Nokia Shanghai Bell은 같은 회사로 취급.
+7. 제약사항: 오직 제공된 소스 문서에 명시된 내용, 회사명, 문서 번호만 사용. 외부 지식을 섞거나 지어내지 마세요.
 
-[출력 양식] (반드시 아래의 마크다운 양식을 똑같이 복제하여 출력할 것)
-### [순위]. [제안의 핵심 요약 제목]
-* 지지 회사 (총 N개사): [회사명1, 회사명2, ...] (중복 제거 후 쉼표로 나열)
-* 상세 제안 내용: [해당 제안의 기술적 배경과 핵심 요구사항을 2~3문장으로 명확하고 이해하기 쉽게 요약]
-* 관련 문서 번호: [해당 제안이 포함된 원문 기고문 번호들 (예: R1-2600126 등)]"""
+[출력 양식] (반드시 아래 형식을 정확히 따를 것)
+### [순위]. [제안의 구체적 동작 요약 제목]
+* **지지 회사 (총 N개사):** 회사명1, 회사명2, ... (중복 제거)
+* **상세 제안 내용:** 해당 제안의 기술적 배경과 핵심 요구사항을 2~3문장으로 요약
+* **근거 문서:**
+  - [문서번호] (회사명): 원문 핵심 내용 요약
+  - [문서번호] (회사명): 원문 핵심 내용 요약
+  - [CR 문서번호] (회사명): Summary of change 내용 요약"""
         st.code(notebooklm_prompt, language="text")
 
     # ── Log ──
