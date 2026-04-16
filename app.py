@@ -46,6 +46,7 @@ DEFAULTS = {
     "ai_summary_bytes": None,
     "ai_summary_text": "",
     "ai_model_name": "",
+    "deep_analysis_cache": {},  # {proposal_hash: result_text} — 심층 분석 캐시
     # Meeting/agenda selection
     "meeting_list": [],
     "agenda_dict": {},
@@ -109,6 +110,39 @@ COMPANY_ALIASES = {
     "interdigital": "InterDigital",
 }
 
+# 메이저 벤더 우선순위 (심층 분석 시 기고문 선정에 사용)
+# Tier 1 = 최우선, Tier 2 = 차선, Tier 3 = 나머지
+MAJOR_VENDORS_TIER1 = ["Huawei", "Qualcomm", "Samsung", "Ericsson", "Nokia", "ZTE", "MediaTek"]
+MAJOR_VENDORS_TIER2 = ["Apple", "Intel", "LG Electronics", "NTT DOCOMO", "CATT", "vivo", "OPPO", "Xiaomi", "InterDigital"]
+
+# Conclusion/Summary/Proposal 섹션 감지 패턴 (모듈 레벨 컴파일로 성능 최적화)
+CONCLUSION_PATTERNS = [
+    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(conclusions?)\s*$", re.I),
+    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(conclusions?\s+and\s+\w+)", re.I),
+    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(summary)\s*$", re.I),
+    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(summary\s+and\s+\w+)", re.I),
+    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(\w+\s+)?summary\s*$", re.I),
+    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(proposals?)\s*$", re.I),
+]
+END_PATTERNS = [
+    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(references?|appendix|acknowledgment|annex)\s*", re.I),
+]
+
+# Gemini 모델 목록 캐시 (세션당 1회만 조회)
+_cached_gemini_models = None
+_cached_gemini_api_key = None
+
+def _get_cached_models(api_key):
+    """genai.list_models() 결과를 API 키별로 캐싱 — 반복 호출 방지"""
+    global _cached_gemini_models, _cached_gemini_api_key
+    if _cached_gemini_models is not None and _cached_gemini_api_key == api_key:
+        return _cached_gemini_models
+    valid_models = [m.name for m in genai.list_models()
+                   if 'generateContent' in m.supported_generation_methods]
+    _cached_gemini_models = valid_models
+    _cached_gemini_api_key = api_key
+    return valid_models
+
 
 def normalize_company(name):
     """회사명을 정규화. 'Sanechips' → 'ZTE', 'HiSilicon' → 'Huawei' 등."""
@@ -128,12 +162,20 @@ def normalize_company(name):
 
 
 def _safe_filename(text, max_len=40):
-    """파일명에 사용할 수 없는 문자 제거 및 길이 제한."""
+    """파일명에 사용할 수 없는 문자 제거 및 길이 제한.
+    Windows 예약 이름(CON, PRN 등) 및 제어 문자도 처리."""
     if not text:
         return "unknown"
-    safe = re.sub(r'[\\/:*?"<>|]', '_', str(text))
+    # Windows 금지 문자 + 제어 문자 제거
+    safe = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]', '_', str(text))
+    # 연속 공백 → 언더스코어
     safe = re.sub(r'\s+', '_', safe)
-    safe = safe.strip('_')
+    # 앞뒤 언더스코어/점 제거 (Windows: 점으로 시작/끝나는 파일명 금지)
+    safe = safe.strip('_.')
+    # Windows 예약 이름 회피
+    WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "LPT1", "LPT2"}
+    if safe.upper() in WINDOWS_RESERVED:
+        safe = f"_{safe}"
     return safe[:max_len] if safe else "unknown"
 
 
@@ -643,11 +685,10 @@ def _download_doc(entry, td_name, headers):
 # ==========================================
 # 4. Output 1 — extract_all_conclusions (원본 동일)
 # ==========================================
-def _cleanup_tmp_if_low_disk():
+def _cleanup_tmp_if_low_disk(force=False):
     """
-    디스크 잔여 용량이 전체의 10% 미만이면 /tmp 안의 이전 다운로드 잔류물을 정리.
-    Cloud Function은 자동 정리되지만, Streamlit 서버에서 직접 처리 시
-    비정상 종료 등으로 /tmp에 파일이 남을 수 있음.
+    디스크 잔여 용량이 전체의 30% 미만이면 /tmp 안의 이전 다운로드 잔류물을 정리.
+    force=True이면 용량 무관하게 3GPP 관련 파일 정리.
     """
     import shutil
     try:
@@ -655,15 +696,21 @@ def _cleanup_tmp_if_low_disk():
         disk = shutil.disk_usage(tmp_dir)
         free_pct = disk.free / disk.total * 100
 
-        if free_pct < 10:
-            append_log(f"⚠️ 디스크 여유 공간 부족 ({free_pct:.1f}%). /tmp 정리 시작...")
+        if free_pct < 30 or force:
+            reason = "강제 정리" if force else f"여유 {free_pct:.1f}%"
+            append_log(f"🧹 /tmp 정리 시작 ({reason})...")
             cleaned = 0
             for item in os.listdir(tmp_dir):
                 item_path = os.path.join(tmp_dir, item)
-                # 3GPP 관련 임시 파일/폴더만 삭제 (안전)
-                if any(kw in item.lower() for kw in ["tmp", "r1-", "r2-", "r3-", "r4-",
-                                                       "s1-", "s2-", "s3-", "c1-", "c3-",
-                                                       "3gpp", "docm_unzip", "repack"]):
+                if any(kw in item.lower() for kw in [
+                    "tmp", "r1-", "r2-", "r3-", "r4-",
+                    "s1-", "s2-", "s3-", "s4-", "s5-", "s6-",
+                    "c1-", "c3-", "c4-",
+                    "3gpp", "docm_unzip", "repack",
+                    ".zip", ".docx", ".docm", ".doc",
+                    ".pptx", ".ppt", ".pdf",
+                    "tsgr", "tsgs", "tsgc", "ct4_",
+                ]):
                     try:
                         if os.path.isdir(item_path):
                             shutil.rmtree(item_path, ignore_errors=True)
@@ -672,12 +719,13 @@ def _cleanup_tmp_if_low_disk():
                         cleaned += 1
                     except Exception:
                         pass
-            append_log(f"정리 완료: {cleaned}개 항목 삭제.")
-            try:
-                disk2 = shutil.disk_usage(tmp_dir)
-                append_log(f"여유 공간: {free_pct:.1f}% → {disk2.free / disk2.total * 100:.1f}%")
-            except Exception:
-                pass
+            if cleaned:
+                append_log(f"정리 완료: {cleaned}개 항목 삭제.")
+                try:
+                    disk2 = shutil.disk_usage(tmp_dir)
+                    append_log(f"여유 공간: {free_pct:.1f}% → {disk2.free / disk2.total * 100:.1f}%")
+                except Exception:
+                    pass
         else:
             append_log(f"디스크 여유: {free_pct:.1f}% (정리 불필요)")
     except Exception as e:
@@ -705,7 +753,7 @@ def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
         od.save(bio)
         bio.seek(0)
         return bio
-    batch_size = 10
+    batch_size = 20  # 10 → 20 (Cloud Function 왕복 횟수 절반으로)
     all_results = []
 
     for i in range(0, total, batch_size):
@@ -760,23 +808,8 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
         od = Document()
         od.add_heading("3GPP Conclusions", level=0)
 
-        cps = [
-            # "3. Conclusion", "Conclusions", "3 Conclusions"
-            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(conclusions?)\s*$", re.I),
-            # "Conclusion and proposals", "Conclusions and Observations"
-            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(conclusions?\s+and\s+\w+)", re.I),
-            # "Summary", "3. Summary"
-            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(summary)\s*$", re.I),
-            # "Summary and proposal", "Summary and observations"
-            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(summary\s+and\s+\w+)", re.I),
-            # "xxx summary" — e.g. "SIB design summary", "Overall summary"
-            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(\w+\s+)?summary\s*$", re.I),
-            # "Proposals" (단독 섹션)
-            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(proposals?)\s*$", re.I),
-        ]
-        eps = [
-            re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(references?|appendix|acknowledgment|annex)\s*", re.I),
-        ]
+        cps = CONCLUSION_PATTERNS  # 모듈 레벨에서 컴파일된 상수 사용
+        eps = END_PATTERNS
         headers = {"User-Agent": "Mozilla/5.0"}
         download_results = []
         extracted_list = []
@@ -789,7 +822,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
             bio.seek(0)
             return bio
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=10) as executor:  # 5 → 10 (다운로드 병렬도 증가)
             futures = {executor.submit(_download_doc, e, temp_dir, headers): e for e in entries}
             for i, fut in enumerate(as_completed(futures), start=1):
                 e, fp, err = fut.result()
@@ -908,8 +941,10 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     try:
                         import fitz  # PyMuPDF
                         pdf_doc = fitz.open(file_path_str)
-                        pdf_texts = [page.get_text() for page in pdf_doc]
-                        pdf_doc.close()
+                        try:
+                            pdf_texts = [page.get_text() for page in pdf_doc]
+                        finally:
+                            pdf_doc.close()
                         pdf_text = "\n".join(pdf_texts)
                         od.add_paragraph(f"[PDF 문서 — 텍스트 추출]")
                         for line in pdf_text.split('\n')[:50]:
@@ -923,12 +958,22 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         })
                         log_func(f"{e['doc']} PDF 추출 완료")
                     except ImportError:
-                        # PyMuPDF 없으면 바이너리 텍스트 추출
+                        # PyMuPDF 없으면 바이너리 텍스트 추출 — 한글/UTF-8 우선 시도
                         try:
                             with open(file_path_str, "rb") as bf:
                                 raw = bf.read()
-                            text_chunks = re.findall(rb'[\x20-\x7E]{20,}', raw)
-                            raw_text = "\n".join(c.decode('ascii', errors='ignore') for c in text_chunks)
+                            # 1차: UTF-8 + 확장 ASCII (한글 포함)
+                            try:
+                                decoded = raw.decode('utf-8', errors='ignore')
+                                # 출력 가능 문자만 유지
+                                raw_text = re.sub(r'[\x00-\x1f\x7f]+', '\n', decoded)
+                                # 의미 있는 라인만 (최소 20자)
+                                lines_filtered = [l for l in raw_text.split('\n') if len(l.strip()) >= 20]
+                                raw_text = "\n".join(lines_filtered)
+                            except:
+                                # 2차: 순수 ASCII만
+                                text_chunks = re.findall(rb'[\x20-\x7E]{20,}', raw)
+                                raw_text = "\n".join(c.decode('ascii', errors='ignore') for c in text_chunks)
                             od.add_paragraph("[PDF — 기본 텍스트 추출]")
                             for line in raw_text.split('\n')[:30]:
                                 od.add_paragraph(line)
@@ -936,7 +981,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                             extracted_list.append({
                                 "doc": e["doc"], "company": e["company"], "link": e["link"],
                                 "title": "(PDF)", "content": raw_text[:3000],
-                                "full_content": raw_text
+                                "full_content": raw_text[:30000]
                             })
                         except Exception as ex:
                             od.add_paragraph(f"PDF 텍스트 추출 실패: {ex}")
@@ -1045,7 +1090,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         "doc": e["doc"], "company": e["company"], "link": e["link"],
                         "title": title, "is_cr": True,
                         "content": "\n".join(doc_text_buffer) if doc_text_buffer else "CR 내용 추출 실패",
-                        "full_content": "\n".join(full_text_buffer) if full_text_buffer else ""
+                        "full_content": ("\n".join(full_text_buffer))[:30000] if full_text_buffer else ""
                     })
                     if idx < len(download_results):
                         od.add_page_break()
@@ -1078,7 +1123,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     "doc": e["doc"], "company": e["company"], "link": e["link"],
                     "title": title,
                     "content": "\n".join(doc_text_buffer) if doc_text_buffer else "Conclusion 섹션을 찾지 못했습니다.",
-                    "full_content": "\n".join(full_text_buffer) if full_text_buffer else "원문 텍스트를 추출하지 못했습니다."
+                    "full_content": ("\n".join(full_text_buffer))[:30000] if full_text_buffer else "원문 텍스트를 추출하지 못했습니다."
                 })
             except Exception as ex:
                 od.add_paragraph(f"오류 - {e['doc']}: {ex}")
@@ -1092,6 +1137,8 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
         bio = io.BytesIO()
         od.save(bio)
         bio.seek(0)
+    # TemporaryDirectory 종료 후 추가 정리 (비정상 종료 잔류물 대비)
+    _cleanup_tmp_if_low_disk(force=True)
     return bio
 
 
@@ -1397,7 +1444,7 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 
     status_elem.text("🧠 Gemini AI 분석 중... 모델을 선택하고 있습니다...")
     try:
-        valid_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        valid_models = _get_cached_models(api_key)
 
         # Flash 모델 우선 사용 (무료 API 호환)
         target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
@@ -1443,7 +1490,7 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                         break
                     except Exception as e:
                         if "429" in str(e) or "503" in str(e):
-                            wait = 60 * (attempt + 1)
+                            wait = [30, 60, 120, 180, 240][min(attempt, 4)]
                             elapsed = int(time.time() - _gemini_start_time)
                             if elapsed > 600:  # 10분 초과
                                 status_elem.text(
@@ -1489,7 +1536,7 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                     response = model.generate_content(rp, generation_config=strict_config); break
                 except Exception as e:
                     if "429" in str(e) or "503" in str(e):
-                        wait = 60 * (attempt + 1)
+                        wait = [30, 60, 120, 180, 240][min(attempt, 4)]
                         for cd in range(wait,0,-1):
                             elapsed = int(time.time() - _gemini_start_time)
                             status_elem.text(f"⚠️ 최종 병합 대기 {cd}초 (시도 {attempt+1}/5, 총 {elapsed//60}분 {elapsed%60}초 경과)"); time.sleep(1)
@@ -1501,7 +1548,7 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                     response = model.generate_content(MAIN_PROMPT, generation_config=strict_config); break
                 except Exception as e:
                     if "429" in str(e) or "503" in str(e):
-                        wait = 60 * (attempt + 1)
+                        wait = [30, 60, 120, 180, 240][min(attempt, 4)]
                         elapsed = int(time.time() - _gemini_start_time)
                         if elapsed > 600:
                             status_elem.text(
@@ -1610,6 +1657,227 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
             )
             append_log(f"Gemini error (sanitized): {err[:200]}")
     return False
+
+
+# ==========================================
+# 6-B. 심층 분석 — 근거 및 반박 논리 분석
+# ==========================================
+
+def _parse_ai_summary_into_proposals(ai_summary_text):
+    """Gemini 결과 마크다운을 제안(###) 단위로 파싱.
+    
+    반환: [{header, body, doc_ids, full_block}, ...]
+    - header: "### 1. Cell DTX/DRX 패턴..."
+    - body: header 뒤의 본문
+    - doc_ids: body에서 추출한 문서번호 set (예: {"R2-2601669", "R2-2601685"})
+    - full_block: header + body 전체
+    """
+    if not ai_summary_text:
+        return []
+    
+    # ### 로 시작하는 헤더 기준 분할
+    parts = re.split(r'\n(?=###\s)', ai_summary_text)
+    proposals = []
+    for part in parts:
+        part = part.strip()
+        if not part.startswith("###"):
+            continue
+        # 헤더와 본문 분리
+        lines = part.split('\n', 1)
+        header = lines[0].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
+        # 문서 번호 추출 (3GPP TDoc 패턴)
+        doc_ids = set(re.findall(r'[A-Z]\d?-\d{7}', part))
+        proposals.append({
+            "header": header,
+            "body": body,
+            "doc_ids": doc_ids,
+            "full_block": part,
+        })
+    return proposals
+
+
+def _select_docs_for_deep_analysis(doc_ids, extracted_data, max_docs=5):
+    """심층 분석용 문서 선정 — 메이저 벤더 우선.
+    
+    doc_ids: 해당 제안에 속한 문서번호 set
+    extracted_data: session state의 전체 추출 데이터
+    max_docs: 최대 문서 수 (기본 5)
+    
+    반환: [{doc, company, full_content, tier}, ...] — tier 순서대로 정렬
+    """
+    # 해당 문서들만 필터
+    matching = [item for item in extracted_data if item.get("doc") in doc_ids]
+    
+    def tier_of(company):
+        if not company:
+            return 3
+        if company in MAJOR_VENDORS_TIER1:
+            return 1
+        if company in MAJOR_VENDORS_TIER2:
+            return 2
+        return 3
+    
+    # Tier 기준 정렬 (동일 tier 내에서는 원래 순서 유지)
+    matching.sort(key=lambda x: tier_of(x.get("company", "")))
+    
+    # 중복 회사 제거 (같은 회사의 여러 문서 중 첫 번째만)
+    seen_companies = set()
+    selected = []
+    for item in matching:
+        comp = item.get("company", "")
+        if comp in seen_companies:
+            continue
+        seen_companies.add(comp)
+        selected.append({
+            "doc": item.get("doc", ""),
+            "company": comp,
+            "full_content": item.get("full_content", ""),
+            "tier": tier_of(comp),
+        })
+        if len(selected) >= max_docs:
+            break
+    
+    return selected
+
+
+def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key):
+    """선정된 문서들의 원문을 바탕으로 근거 및 반박 논리 분석.
+    
+    반환: (success: bool, result_text: str)
+    """
+    if not selected_docs:
+        return False, "분석 가능한 문서가 없습니다."
+    
+    try:
+        genai.configure(api_key=api_key)
+
+        # 모델 선택 (캐시 사용 — 반복 호출 방지)
+        valid_models = _get_cached_models(api_key)
+        target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
+                     valid_models[-1] if valid_models else "gemini-1.5-flash")
+        
+        model = genai.GenerativeModel(
+            model_name=target,
+            generation_config={"temperature": 0.2, "max_output_tokens": 3000},
+            safety_settings=[
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ],
+        )
+        
+        # 선정된 문서들의 원문 텍스트 구성 — 스마트 자르기
+        # Proposal/Conclusion/Observation이 포함된 부분 우선 보존
+        def _smart_truncate(text, max_chars=10000):
+            if len(text) <= max_chars:
+                return text
+            # 핵심 키워드 주변 텍스트 우선 추출
+            lines = text.split('\n')
+            important_lines = []
+            other_lines = []
+            for line in lines:
+                low = line.lower()
+                if any(kw in low for kw in ["proposal", "conclusion", "observation",
+                                              "summary", "recommendation", "way forward"]):
+                    important_lines.append(line)
+                else:
+                    other_lines.append(line)
+            # 중요 라인 먼저, 남은 공간에 일반 라인 채움
+            result = "\n".join(important_lines)
+            if len(result) > max_chars:
+                return result[:max_chars]
+            remaining = max_chars - len(result) - 50  # 구분자 여유
+            if remaining > 0 and other_lines:
+                other_text = "\n".join(other_lines)
+                result += "\n\n[기타 본문 발췌]\n" + other_text[:remaining]
+            return result
+
+        doc_texts = []
+        for d in selected_docs:
+            content = _smart_truncate(d["full_content"], 10000)
+            doc_texts.append(f"\n━━━ 문서: {d['doc']} ({d['company']}) ━━━\n{content}")
+
+        combined_content = "\n".join(doc_texts)
+        
+        prompt = f"""당신은 3GPP 표준화 회의 기고문을 심층 분석하는 전문가입니다.
+
+아래 제안에 대해, 지지 회사들의 원문을 바탕으로 **근거와 반박 논리**를 분석해주세요.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[분석 대상 제안]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{proposal_header}
+
+{proposal_body}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[지지 회사 원문 ({len(selected_docs)}개 기고문)]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{combined_content}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[출력 규칙]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. 오직 위에 제공된 원문에 있는 내용만 사용하세요. 외부 지식 금지.
+2. 원문에 명시적으로 없는 내용을 추론/창작하지 마세요.
+3. 근거는 회사별로 구체적으로 인용하세요.
+4. 반박 논리는 다음 두 관점에서만 제시:
+   (a) 원문에 다른 회사가 실제로 제기한 반대 의견 (있는 경우)
+   (b) 기술적/구현적 한계로 추론 가능한 합리적 반박 (반드시 "추론"이라고 명시)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[출력 양식 — 반드시 아래 형식을 정확히 따르세요]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+### 🧠 주장의 근거 및 논리
+
+**핵심 논거:**
+1. [논거 1 — 기술적 이유/필요성]
+2. [논거 2]
+3. [논거 3]
+
+**회사별 논리 전개:**
+- **[회사A] ([문서번호]):** 이 회사의 논리 전개 요약 (2-3문장)
+- **[회사B] ([문서번호]):** ...
+
+### ⚡ 가능한 반박 논리
+
+**(a) 원문에 나타난 반대 의견:**
+- [있으면 여기에 인용, 없으면 "원문에는 명시적 반대 의견이 보이지 않음" 기재]
+
+**(b) 추론 가능한 기술적 반박:**
+1. **[반박 관점 1]**: 구체적 기술적 우려사항 (반드시 "추론" 명시)
+2. **[반박 관점 2]**: ...
+
+### 🎯 전략적 함의
+- [이 제안이 채택되었을 때 영향 / 어떤 회사군에 유리한지 등 1-2문장]
+"""
+        
+        response = model.generate_content(prompt)
+        if not response or not hasattr(response, 'text'):
+            return False, "API 응답을 받지 못했습니다."
+        
+        try:
+            result = response.text
+        except (ValueError, AttributeError):
+            return False, "AI 응답이 안전 필터에 의해 차단되었습니다."
+        
+        if not result or len(result.strip()) < 50:
+            return False, "AI 응답이 너무 짧습니다."
+        
+        return True, result
+    
+    except Exception as e:
+        err = str(e)
+        if GEMINI_API_KEY and GEMINI_API_KEY in err:
+            err = err.replace(GEMINI_API_KEY, "***HIDDEN***")
+        if api_key and api_key in err:
+            err = err.replace(api_key, "***HIDDEN***")
+        if "429" in err or "Quota" in err or "exhausted" in err.lower():
+            return False, "API 한도 초과. 개인 API 키를 사용하거나 잠시 후 다시 시도하세요."
+        return False, f"오류: {err[:200]}"
 
 
 # ==========================================
@@ -1837,10 +2105,17 @@ elif page == "🚀 통합 분석기":
         if not entries:
             st.warning("먼저 데이터를 입력해주세요.")
         else:
+            # ★ 이전 분석 데이터 초기화 (메모리 절약) ★
             st.session_state.log_text = ""
             st.session_state.process_done = False
             st.session_state.ai_summary_generated = False
             st.session_state.ai_summary_bytes = None
+            st.session_state.ai_summary_text = ""
+            st.session_state.out1_bytes = None
+            st.session_state.out2_bytes = None
+            st.session_state.extracted_data = []
+            st.session_state.notebooklm_txt = None
+            st.session_state.deep_analysis_cache = {}
 
             # 시각적 진행률 표시
             progress_container = st.container()
@@ -2012,8 +2287,104 @@ elif page == "🚀 통합 분석기":
                 file_name=f"Output3_AI_Summary_{agenda_tag}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 type="primary", use_container_width=True)
-            with st.expander("👀 AI 분석 결과 미리보기", expanded=True):
-                st.markdown(st.session_state.ai_summary_text)
+
+            # 제안 단위로 파싱
+            proposals = _parse_ai_summary_into_proposals(st.session_state.ai_summary_text)
+
+            # 심층 분석 버튼 눈에 띄게 만들기 위한 CSS
+            st.markdown("""
+<style>
+div.stButton > button[kind="primary"] {
+    background-color: #FF4B4B;
+    color: white;
+    border: 2px solid #D32F2F;
+    font-weight: bold;
+    font-size: 1.05em;
+    padding: 0.6em 1em;
+    box-shadow: 0 2px 6px rgba(255,75,75,0.3);
+    transition: all 0.2s ease;
+}
+div.stButton > button[kind="primary"]:hover {
+    background-color: #D32F2F;
+    box-shadow: 0 4px 12px rgba(255,75,75,0.5);
+    transform: translateY(-1px);
+}
+</style>
+            """, unsafe_allow_html=True)
+
+            with st.expander("👀 AI 분석 결과 미리보기 + 심층 분석", expanded=True):
+                if not proposals:
+                    # 파싱 실패 시 기존 방식으로 표시
+                    st.markdown(st.session_state.ai_summary_text)
+                else:
+                    st.info(f"💡 총 {len(proposals)}개 제안 그룹이 추출되었습니다. 각 제안 아래 **'근거 및 반박 논리 분석'** 버튼을 누르면 해당 주장의 **논거·반박·전략적 함의**를 깊이 분석합니다. (메이저 벤더 기고문 최대 5개 기준)")
+
+                    for p_idx, prop in enumerate(proposals):
+                        # 제안 본문 표시
+                        st.markdown(prop["full_block"])
+
+                        # 심층 분석 가능 여부 체크
+                        if not prop["doc_ids"]:
+                            st.caption("ℹ️ 이 제안에는 문서 번호가 없어 심층 분석을 할 수 없습니다.")
+                            st.markdown("---")
+                            continue
+
+                        # 캐시 키 (제안 헤더 + 문서 목록 기준)
+                        cache_key = f"{prop['header']}_{sorted(prop['doc_ids'])}"
+
+                        col_btn, col_info = st.columns([2, 3])
+                        with col_btn:
+                            btn_clicked = st.button(
+                                "🔍 근거 및 반박 논리 분석",
+                                key=f"deep_btn_{p_idx}",
+                                type="primary",
+                                use_container_width=True
+                            )
+                        with col_info:
+                            # 선정 예정 문서 미리보기
+                            preview_docs = _select_docs_for_deep_analysis(
+                                prop["doc_ids"], st.session_state.extracted_data, max_docs=5
+                            )
+                            if preview_docs:
+                                preview_str = ", ".join([f"{d['company']}" for d in preview_docs])
+                                st.caption(f"📋 분석 대상 {len(preview_docs)}개사: {preview_str}")
+
+                        # 버튼 클릭 처리
+                        if btn_clicked:
+                            with st.spinner(f"🔍 '{prop['header'][:50]}...' 심층 분석 중... (약 20~40초)"):
+                                selected_docs = _select_docs_for_deep_analysis(
+                                    prop["doc_ids"], st.session_state.extracted_data, max_docs=5
+                                )
+                                if not selected_docs:
+                                    st.error("❌ 분석할 문서가 메모리에 없습니다. 기본 분석을 다시 실행해주세요.")
+                                else:
+                                    # api_key_to_use는 같은 페이지 상단에서 이미 설정됨
+                                    deep_api_key = api_key_to_use or GEMINI_API_KEY
+                                    if not deep_api_key:
+                                        st.error("❌ API 키가 설정되지 않았습니다.")
+                                    else:
+                                        success, result = run_deep_analysis(
+                                            prop["header"], prop["body"],
+                                            selected_docs, deep_api_key
+                                        )
+                                        if success:
+                                            # 캐시 크기 제한 (FIFO, 최대 30개)
+                                            if len(st.session_state.deep_analysis_cache) >= 30:
+                                                oldest = next(iter(st.session_state.deep_analysis_cache))
+                                                del st.session_state.deep_analysis_cache[oldest]
+                                            st.session_state.deep_analysis_cache[cache_key] = result
+                                            st.rerun()
+                                        else:
+                                            st.error(f"❌ 심층 분석 실패: {result}")
+
+                        # 캐시된 결과가 있으면 표시
+                        if cache_key in st.session_state.deep_analysis_cache:
+                            with st.container():
+                                st.markdown("---")
+                                st.markdown(f"#### 🔬 심층 분석 결과 — {prop['header'].replace('###','').strip()}")
+                                st.markdown(st.session_state.deep_analysis_cache[cache_key])
+
+                        st.markdown("---")
 
         # ══════════════════════════════════════════════
         # Step 4: NotebookLM 활용 가이드 (Gemini 아래 배치)
