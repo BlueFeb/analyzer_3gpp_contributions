@@ -1993,8 +1993,9 @@ elif page == "🚀 통합 분석기":
     st.title("🚀 3GPP 기고문 통합 분석기")
     st.caption("Output 1·2는 기본 | Output 3 Gemini는 선택")
 
-    with st.expander("🆕 v2.1 업데이트 안내", expanded=True):
+    with st.expander("🆕 v2.2 업데이트 안내", expanded=True):
         st.markdown("""
+- **🔍 근거 및 반박 논리 분석 버튼** — Output 3의 각 제안별로 주장의 근거·반박·전략적 함의를 심층 분석 (메이저 벤더 기고문 최대 5개 기준)
 - **CR (Change Request) 자동 인식** — Reason for change, Summary of change 추출 및 AI 분석에 반영
 - **다양한 문서 형식** — `.docx`, `.doc`, `.pptx`, `.pdf` 모두 지원
         """)
