@@ -29,6 +29,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import google.generativeai as genai
 
+# verify=False 사용 시 발생하는 InsecureRequestWarning 억제 (로그 정리)
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+# TF-IDF 전처리용 정규식 (모듈 레벨 컴파일 — 반복 호출 시 성능)
+_RE_NONWORD = re.compile(r"[^\w\s\-]")
+_RE_SPACES = re.compile(r"\s+")
+
 # ==========================================
 # 1. Page Config & Session State
 # ==========================================
@@ -201,6 +212,15 @@ def read_excel_from_bytes(uploaded_file):
     return entries
 
 
+def _normalize_bis(s):
+    """회의 suffix 'b' ↔ 'bis' 동일 취급 헬퍼."""
+    if s.startswith("bis"):
+        return "bis" + s[3:]
+    if s.startswith("b") and (len(s) == 1 or not s[1].isalpha()):
+        return "bis" + s[1:]
+    return s
+
+
 # ==========================================
 # 3b. 회의 번호 → FTP에서 TDoc 리스트 xlsx 자동 조회
 # ==========================================
@@ -367,12 +387,32 @@ def resolve_meeting_folder(wg, meeting_num):
                 if candidate not in candidates_to_try:
                     candidates_to_try.append(candidate)
 
-    # 시도 1: 단순 이름 변형들로 바로 접근
-    for candidate in candidates_to_try:
+    # 시도 1: 단순 이름 변형들로 바로 접근 (병렬 HEAD)
+    def _try_head(candidate):
         test_url = f"https://www.3gpp.org/ftp/{ftp_path}/{candidate}/Docs/"
         r = _request_with_retry(test_url, method="head", max_retries=2, timeout=15)
-        if r and r.status_code == 200:
-            return candidate
+        return candidate, (r and r.status_code == 200)
+
+    if len(candidates_to_try) == 1:
+        # 후보 1개는 병렬화 오버헤드 불필요
+        cand, ok = _try_head(candidates_to_try[0])
+        if ok:
+            return cand
+    else:
+        # 후보 여러 개는 병렬 HEAD — 순서 보존을 위해 dict 사용
+        results = {}
+        with ThreadPoolExecutor(max_workers=min(len(candidates_to_try), 5)) as ex:
+            futures = {ex.submit(_try_head, c): c for c in candidates_to_try}
+            for fut in as_completed(futures):
+                try:
+                    cand, ok = fut.result()
+                    results[cand] = ok
+                except Exception:
+                    results[futures[fut]] = False
+        # 원래 후보 순서대로 첫 번째 성공 반환
+        for c in candidates_to_try:
+            if results.get(c):
+                return c
 
     # 시도 2: FTP 디렉토리 리스팅에서 매칭되는 폴더 찾기
     dir_url = f"https://www.3gpp.org/ftp/{ftp_path}/"
@@ -414,12 +454,7 @@ def resolve_meeting_folder(wg, meeting_num):
                 # suffix 정규화: b ↔ bis 동일 취급
                 normalized_suffix = suffix_part.replace("-", "").replace("_", "")
                 normalized_folder = folder_rest.replace("-", "").replace("_", "")
-                # "b" 와 "bis" 를 동일하게 취급
-                def normalize_bis(s):
-                    if s.startswith("bis"): return "bis" + s[3:]
-                    if s.startswith("b") and (len(s) == 1 or not s[1].isalpha()): return "bis" + s[1:]
-                    return s
-                if normalize_bis(normalized_folder).startswith(normalize_bis(normalized_suffix)):
+                if _normalize_bis(normalized_folder).startswith(_normalize_bis(normalized_suffix)):
                     found.append(name)
             else:
                 # suffix 없으면 (순수 숫자 입력, 예: "156")
@@ -669,17 +704,26 @@ def repackage_docm_to_docx(path, td):
     return out
 
 
-def _download_doc(entry, td_name, headers):
-    try:
-        kwargs = {"headers": headers, "timeout": 60, "verify": False}
-        r = requests.get(entry["link"], **kwargs)
-        r.raise_for_status()
-        fp = os.path.join(td_name, f"{entry['doc']}.zip")
-        with open(fp, "wb") as f:
-            f.write(r.content)
-        return entry, fp, None
-    except Exception as ex:
-        return entry, None, str(ex)
+def _download_doc(entry, td_name, headers, max_retries=3):
+    """3GPP 서버에서 zip 다운로드. 일시적 실패 시 재시도."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            kwargs = {"headers": headers, "timeout": 60, "verify": False}
+            r = requests.get(entry["link"], **kwargs)
+            r.raise_for_status()
+            fp = os.path.join(td_name, f"{entry['doc']}.zip")
+            with open(fp, "wb") as f:
+                f.write(r.content)
+            return entry, fp, None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as ex:
+            last_error = str(ex)
+            if attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))  # 2초, 4초 대기
+        except Exception as ex:
+            # HTTP 4xx/5xx는 재시도 가치 낮음 → 즉시 실패
+            return entry, None, str(ex)
+    return entry, None, last_error or "Download failed after retries"
 
 
 # ==========================================
@@ -776,6 +820,12 @@ def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
         tbl.cell(3,0).text, tbl.cell(3,1).text = "Title", item.get("title","")
 
         content = item.get("content","")
+        # ★ CR 감지 — Cloud Function이 content 첫 줄에 "[CR — Change Request 문서]" 프리픽스를 붙임
+        is_cr_cloud = bool(content) and (
+            content.lstrip().startswith("[CR — Change Request 문서]") or
+            content.lstrip().startswith("[CR \u2014 Change Request")  # em-dash 변형 대비
+        )
+
         if content and content not in ("결론 섹션 없음","DOC 파일 없음"):
             for line in content.split("\n"):
                 if line.strip():
@@ -786,6 +836,7 @@ def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
         extracted_list.append({
             "doc": item.get("doc",""), "company": item.get("company",""),
             "link": item.get("link",""), "title": item.get("title",""),
+            "is_cr": is_cr_cloud,
             "content": content,
             "full_content": content,
         })
@@ -858,12 +909,21 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                 if not src_path:
                     od.add_paragraph("문서 파일을 찾을 수 없습니다 (docx/doc/ppt/pdf).")
                     log_func(f"{e['doc']} 파일 없음")
+                    extracted_list.append({
+                        "doc": e["doc"], "company": e["company"], "link": e["link"],
+                        "title": "(파일 없음)",
+                        "content": "zip 내부에 문서 파일이 없습니다 (docx/doc/ppt/pdf)",
+                        "full_content": ""
+                    })
+                    if idx < len(download_results):
+                        od.add_page_break()
                     continue
 
                 file_path_str = str(src_path)
 
                 # .doc (구형 바이너리) 파일 처리 — python-docx로 열 수 없음
                 if src_path.suffix.lower() == ".doc":
+                    doc_appended = False
                     try:
                         # 바이너리에서 텍스트 추출 시도 (완벽하지 않지만 Proposal/Conclusion 키워드 포착 가능)
                         with open(file_path_str, "rb") as bf:
@@ -894,6 +954,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                                 "content": "\n".join(doc_text_buffer) if doc_text_buffer else "텍스트 추출 실패",
                                 "full_content": raw_text[:5000]
                             })
+                            doc_appended = True
                             log_func(f"{e['doc']} .doc 텍스트 추출")
                         else:
                             od.add_paragraph("구형 .doc 파일에서 텍스트를 추출할 수 없습니다.")
@@ -901,12 +962,21 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     except Exception as ex:
                         od.add_paragraph(f"구형 .doc 파일 처리 오류: {ex}")
                         log_func(f"{e['doc']} .doc 오류: {ex}")
+                    # 추출 실패 시에도 placeholder 레코드로 남겨서 downstream(NotebookLM/심층분석)에서 유실 방지
+                    if not doc_appended:
+                        extracted_list.append({
+                            "doc": e["doc"], "company": e["company"], "link": e["link"],
+                            "title": "(구형 .doc — 추출 실패)",
+                            "content": "구형 .doc 텍스트 추출 실패",
+                            "full_content": ""
+                        })
                     if idx < len(download_results):
                         od.add_page_break()
                     continue
 
                 # .pptx/.ppt 파일 처리
                 if src_path.suffix.lower() in (".pptx", ".ppt"):
+                    ppt_appended = False
                     try:
                         from pptx import Presentation
                         prs = Presentation(file_path_str)
@@ -926,18 +996,27 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                             "title": "(PPT)", "content": ppt_text[:5000],
                             "full_content": ppt_text
                         })
+                        ppt_appended = True
                         log_func(f"{e['doc']} PPT 추출 완료")
                     except ImportError:
                         od.add_paragraph("PPT 파싱 라이브러리 없음 (python-pptx)")
                     except Exception as ex:
                         od.add_paragraph(f"PPT 처리 오류: {ex}")
                         log_func(f"{e['doc']} PPT 오류: {ex}")
+                    if not ppt_appended:
+                        extracted_list.append({
+                            "doc": e["doc"], "company": e["company"], "link": e["link"],
+                            "title": "(PPT — 추출 실패)",
+                            "content": "PPT 텍스트 추출 실패",
+                            "full_content": ""
+                        })
                     if idx < len(download_results):
                         od.add_page_break()
                     continue
 
                 # .pdf 파일 처리
                 if src_path.suffix.lower() == ".pdf":
+                    pdf_appended = False
                     try:
                         import fitz  # PyMuPDF
                         pdf_doc = fitz.open(file_path_str)
@@ -956,6 +1035,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                             "title": "(PDF)", "content": pdf_text[:5000],
                             "full_content": pdf_text
                         })
+                        pdf_appended = True
                         log_func(f"{e['doc']} PDF 추출 완료")
                     except ImportError:
                         # PyMuPDF 없으면 바이너리 텍스트 추출 — 한글/UTF-8 우선 시도
@@ -983,11 +1063,19 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                                 "title": "(PDF)", "content": raw_text[:3000],
                                 "full_content": raw_text[:30000]
                             })
+                            pdf_appended = True
                         except Exception as ex:
                             od.add_paragraph(f"PDF 텍스트 추출 실패: {ex}")
                     except Exception as ex:
                         od.add_paragraph(f"PDF 처리 오류: {ex}")
                         log_func(f"{e['doc']} PDF 오류: {ex}")
+                    if not pdf_appended:
+                        extracted_list.append({
+                            "doc": e["doc"], "company": e["company"], "link": e["link"],
+                            "title": "(PDF — 추출 실패)",
+                            "content": "PDF 텍스트 추출 실패",
+                            "full_content": ""
+                        })
                     if idx < len(download_results):
                         od.add_page_break()
                     continue
@@ -1003,6 +1091,14 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                 except Exception as ex:
                     od.add_paragraph(f"문서를 열 수 없습니다 (구형 .doc 파일이거나 손상됨): {ex}")
                     log_func(f"{e['doc']} 문서 파싱 에러: {ex}")
+                    extracted_list.append({
+                        "doc": e["doc"], "company": e["company"], "link": e["link"],
+                        "title": "(문서 열기 실패)",
+                        "content": f"문서를 열 수 없습니다: {str(ex)[:200]}",
+                        "full_content": ""
+                    })
+                    if idx < len(download_results):
+                        od.add_page_break()
                     continue
 
                 title = ""
@@ -1128,6 +1224,17 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
             except Exception as ex:
                 od.add_paragraph(f"오류 - {e['doc']}: {ex}")
                 log_func(str(ex))
+                # 예외로 인해 append가 이뤄지지 않았을 수 있으므로 placeholder 추가
+                # (이미 성공 분기에서 append된 경우, 같은 문서가 중복될 수 있지만
+                #  성공 분기는 try 끝에서 바로 append 후 exception 없이 빠져나가므로 실제 중복은 드묾.
+                #  중복 방지를 위해 마지막 entry의 doc 번호를 체크)
+                if not extracted_list or extracted_list[-1].get("doc") != e["doc"]:
+                    extracted_list.append({
+                        "doc": e["doc"], "company": e["company"], "link": e["link"],
+                        "title": "(처리 오류)",
+                        "content": f"문서 처리 중 오류 발생: {str(ex)[:200]}",
+                        "full_content": ""
+                    })
 
             if idx < len(download_results):
                 od.add_page_break()
@@ -1175,7 +1282,7 @@ class TFIDFEmbedder:
 
     def encode(self, texts):
         if isinstance(texts, str): texts = [texts]
-        proc = [re.sub(r"\s+", " ", re.sub(r"[^\w\s\-]", " ", t.lower())).strip() for t in texts]
+        proc = [_RE_SPACES.sub(" ", _RE_NONWORD.sub(" ", t.lower())).strip() for t in texts]
         if not self.fitted:
             self.v.fit(proc)
             self.fitted = True
@@ -1446,6 +1553,15 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
     try:
         valid_models = _get_cached_models(api_key)
 
+        # valid_models가 비어있으면 API 키 문제 또는 네트워크 이슈
+        if not valid_models:
+            st.error(
+                "❌ **사용 가능한 Gemini 모델을 찾지 못했습니다.**\n\n"
+                "API 키가 만료되었거나 네트워크가 불안정할 수 있습니다.\n\n"
+                "**해결 방법:** 잠시 후 다시 시도하거나, 개인 API 키로 전환해 보세요."
+            )
+            return False
+
         # Flash 모델 우선 사용 (무료 API 호환)
         target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
                        next((m for m in valid_models if 'pro' in m.lower() and 'vision' not in m.lower()), valid_models[-1]))
@@ -1470,7 +1586,9 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                 status_elem.text(f"🚀 1차 추출 [{i+1}/{total_batches}]")
                 batch = extracted_data[i*batch_size:(i+1)*batch_size]
                 bt = "\n\n".join([
-                    f"========== {it['doc']} ({it['company']}) ==========\n{it['content']}"
+                    f"========== {it['doc']} ({it['company']}) ==========\n"
+                    f"제목: {it.get('title', '')}\n"
+                    f"{it['content']}"
                     for it in batch
                 ])
                 batch_docs = ", ".join([it['doc'] for it in batch])
@@ -1619,7 +1737,9 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
         for line in result_text.split('\n'):
             if re.match(r'^(#+)?\s*\d+\.|^###', line.strip()):
                 p = doc.add_paragraph()
-                p.add_run(line.replace('#','').strip()).bold = True
+                # 선두의 # 들만 제거 (본문 중 #1, C# 같은 해시는 보존)
+                cleaned = re.sub(r'^\s*#+\s*', '', line).strip()
+                p.add_run(cleaned).bold = True
             elif line.strip().startswith('* **'):
                 doc.add_paragraph(line.strip())
             elif line.strip().startswith('- [') or line.strip().startswith('- '):
@@ -1634,6 +1754,7 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
         st.session_state.ai_summary_generated = True
         status_elem.text("✅ 완료! 아래에서 결과를 확인하세요.")
         st.rerun()
+        return True  # st.rerun()이 먼저 동작하지만 시그니처 일관성 유지
 
     except Exception as e:
         err = str(e)
@@ -1754,8 +1875,10 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key):
 
         # 모델 선택 (캐시 사용 — 반복 호출 방지)
         valid_models = _get_cached_models(api_key)
+        if not valid_models:
+            return False, "사용 가능한 Gemini 모델을 찾지 못했습니다. API 키 또는 네트워크를 확인하세요."
         target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
-                     valid_models[-1] if valid_models else "gemini-1.5-flash")
+                     valid_models[-1])
         
         model = genai.GenerativeModel(
             model_name=target,
@@ -2018,6 +2141,13 @@ elif page == "🚀 통합 분석기":
 
         with col_wg:
             wg = st.selectbox("Working Group:", list(WG_FTP_MAP.keys()))
+
+        # WG가 바뀌었으면 이전 조회 결과(resolved_folder/agenda) 리셋 — 경로 불일치 방지
+        if st.session_state.get("_last_selected_wg") != wg:
+            st.session_state["_last_selected_wg"] = wg
+            st.session_state["resolved_folder"] = None
+            st.session_state["agenda_dict"] = {}
+            st.session_state["all_entries"] = []
 
         with col_num:
             meeting_num_input = st.text_input(
@@ -2331,8 +2461,8 @@ div.stButton > button[kind="primary"]:hover {
                             st.markdown("---")
                             continue
 
-                        # 캐시 키 (제안 헤더 + 문서 목록 기준)
-                        cache_key = f"{prop['header']}_{sorted(prop['doc_ids'])}"
+                        # 캐시 키 (제안 헤더 + 문서 목록 기준) — tuple(sorted())로 안정화
+                        cache_key = (prop['header'], tuple(sorted(prop['doc_ids'])))
 
                         col_btn, col_info = st.columns([2, 3])
                         with col_btn:
@@ -2370,8 +2500,11 @@ div.stButton > button[kind="primary"]:hover {
                                             selected_docs, deep_api_key
                                         )
                                         if success:
-                                            # 캐시 크기 제한 (FIFO, 최대 30개)
-                                            if len(st.session_state.deep_analysis_cache) >= 30:
+                                            # 캐시 크기 제한 (LRU, 최대 30개)
+                                            # 같은 키가 이미 있으면 삭제 후 재삽입 (dict 삽입순서 = LRU)
+                                            if cache_key in st.session_state.deep_analysis_cache:
+                                                del st.session_state.deep_analysis_cache[cache_key]
+                                            elif len(st.session_state.deep_analysis_cache) >= 30:
                                                 oldest = next(iter(st.session_state.deep_analysis_cache))
                                                 del st.session_state.deep_analysis_cache[oldest]
                                             st.session_state.deep_analysis_cache[cache_key] = result
