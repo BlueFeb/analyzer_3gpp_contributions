@@ -41,6 +41,60 @@ _RE_NONWORD = re.compile(r"[^\w\s\-]")
 _RE_SPACES = re.compile(r"\s+")
 
 # ==========================================
+# XML-안전 문자열 정규화 (python-docx ValueError 방어)
+# ==========================================
+# XML 1.0 스펙상 금지된 제어 문자. python-docx(lxml)는 이런 문자를
+# 만나면 ValueError를 던지며 전체 분석이 중단됨.
+# .doc 바이너리 추출, Cloud Function 응답, PDF 추출, 구형 문서의 필드
+# 구분자 등에서 NULL(\x00)이나 제어 문자가 섞여 들어올 수 있음.
+# 허용: \t (0x09), \n (0x0A), \r (0x0D) 및 0x20 이상 일반 문자
+# 제거: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, surrogate pair, XML 비문자
+_RE_XML_ILLEGAL = re.compile(
+    r'[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]'
+)
+
+def _xml_safe(text):
+    """python-docx(lxml)에 넣기 전에 XML 금지 문자를 제거.
+    문자열이 아니어도 안전하게 처리. None/비문자열은 빈 문자열 반환."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            return ""
+    return _RE_XML_ILLEGAL.sub('', text)
+
+
+def _safe_add_paragraph(doc_or_cell, text, style=None):
+    """docx 문서/셀에 문단을 추가할 때 XML-안전 처리 후 추가.
+    예외 발생 시에도 분석이 중단되지 않도록 최대한 방어."""
+    try:
+        safe = _xml_safe(text)
+        if style is not None:
+            return doc_or_cell.add_paragraph(safe, style=style)
+        return doc_or_cell.add_paragraph(safe)
+    except Exception:
+        # 최후의 보루: ASCII만 남기고 재시도
+        try:
+            ascii_only = re.sub(r'[^\x20-\x7E\t\n\r]', '', str(text or ''))
+            return doc_or_cell.add_paragraph(ascii_only)
+        except Exception:
+            return doc_or_cell.add_paragraph("")
+
+
+def _safe_set_cell_text(cell, text):
+    """테이블 셀에 텍스트를 안전하게 할당."""
+    try:
+        cell.text = _xml_safe(text)
+    except Exception:
+        try:
+            cell.text = re.sub(r'[^\x20-\x7E\t\n\r]', '', str(text or ''))
+        except Exception:
+            cell.text = ""
+
+
+# ==========================================
 # 1. Page Config & Session State
 # ==========================================
 st.set_page_config(page_title="3GPP Analyzer v2", page_icon="📡", layout="wide")
@@ -663,16 +717,23 @@ def fetch_tdoc_list_xlsx(wg, meeting_folder):
 def clone_paragraph(src, dest):
     np_para = dest.add_paragraph("", style=src.style)
     for r in src.runs:
-        nr = np_para.add_run(r.text)
-        nr.bold = r.bold
-        nr.italic = r.italic
-        nr.underline = r.underline
-        if hasattr(r.font, "name") and r.font.name:
-            nr.font.name = r.font.name
-        if hasattr(r.font, "size") and r.font.size:
-            nr.font.size = r.font.size
-        if hasattr(r.font, "color") and getattr(r.font.color, "rgb", None):
-            nr.font.color.rgb = r.font.color.rgb
+        try:
+            nr = np_para.add_run(_xml_safe(r.text))
+            nr.bold = r.bold
+            nr.italic = r.italic
+            nr.underline = r.underline
+            if hasattr(r.font, "name") and r.font.name:
+                nr.font.name = r.font.name
+            if hasattr(r.font, "size") and r.font.size:
+                nr.font.size = r.font.size
+            if hasattr(r.font, "color") and getattr(r.font.color, "rgb", None):
+                nr.font.color.rgb = r.font.color.rgb
+        except Exception:
+            # 서식 복제 실패 시 텍스트만이라도 추가
+            try:
+                np_para.add_run(_xml_safe(r.text))
+            except Exception:
+                pass
     return np_para
 
 
@@ -813,36 +874,60 @@ def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
             return _extract_local(entries, status_elem, progress_elem, log_func)
 
     for idx, item in enumerate(all_results, 1):
-        tbl = od.add_table(rows=4, cols=2, style="Table Grid")
-        tbl.cell(0,0).text, tbl.cell(0,1).text = "Document", item.get("doc","")
-        tbl.cell(1,0).text, tbl.cell(1,1).text = "Link", item.get("link","")
-        tbl.cell(2,0).text, tbl.cell(2,1).text = "Company", item.get("company","")
-        tbl.cell(3,0).text, tbl.cell(3,1).text = "Title", item.get("title","")
+        try:
+            tbl = od.add_table(rows=4, cols=2, style="Table Grid")
+            _safe_set_cell_text(tbl.cell(0, 0), "Document")
+            _safe_set_cell_text(tbl.cell(0, 1), item.get("doc", ""))
+            _safe_set_cell_text(tbl.cell(1, 0), "Link")
+            _safe_set_cell_text(tbl.cell(1, 1), item.get("link", ""))
+            _safe_set_cell_text(tbl.cell(2, 0), "Company")
+            _safe_set_cell_text(tbl.cell(2, 1), item.get("company", ""))
+            _safe_set_cell_text(tbl.cell(3, 0), "Title")
+            _safe_set_cell_text(tbl.cell(3, 1), item.get("title", ""))
 
-        content = item.get("content","")
-        # ★ CR 감지 — Cloud Function이 content 첫 줄에 "[CR — Change Request 문서]" 프리픽스를 붙임
-        is_cr_cloud = bool(content) and (
-            content.lstrip().startswith("[CR — Change Request 문서]") or
-            content.lstrip().startswith("[CR \u2014 Change Request")  # em-dash 변형 대비
-        )
+            content = item.get("content", "") or ""
+            # ★ CR 감지 — Cloud Function이 content 첫 줄에 "[CR — Change Request 문서]" 프리픽스를 붙임
+            is_cr_cloud = bool(content) and (
+                content.lstrip().startswith("[CR — Change Request 문서]") or
+                content.lstrip().startswith("[CR \u2014 Change Request")  # em-dash 변형 대비
+            )
 
-        if content and content not in ("결론 섹션 없음","DOC 파일 없음"):
-            for line in content.split("\n"):
-                if line.strip():
-                    od.add_paragraph(line)
-        else:
-            od.add_paragraph(content or "결론 섹션 없음")
+            if content and content not in ("결론 섹션 없음", "DOC 파일 없음"):
+                for line in content.split("\n"):
+                    if line.strip():
+                        _safe_add_paragraph(od, line)
+            else:
+                _safe_add_paragraph(od, content or "결론 섹션 없음")
 
-        extracted_list.append({
-            "doc": item.get("doc",""), "company": item.get("company",""),
-            "link": item.get("link",""), "title": item.get("title",""),
-            "is_cr": is_cr_cloud,
-            "content": content,
-            "full_content": content,
-        })
-        log_func(f"{item.get('doc','')} 추출 완료")
+            extracted_list.append({
+                "doc": item.get("doc", ""), "company": item.get("company", ""),
+                "link": item.get("link", ""), "title": item.get("title", ""),
+                "is_cr": is_cr_cloud,
+                "content": content,
+                "full_content": content,
+            })
+            log_func(f"{item.get('doc','')} 추출 완료")
+        except Exception as ex:
+            # 단일 아이템에서 에러가 나도 전체 분석이 죽지 않도록 방어
+            log_func(f"Cloud 아이템 처리 오류 ({item.get('doc','?')}): {ex}")
+            try:
+                _safe_add_paragraph(od, f"[처리 오류] {item.get('doc','?')}: {str(ex)[:200]}")
+            except Exception:
+                pass
+            # extracted_list에도 placeholder 추가 (downstream 유실 방지)
+            extracted_list.append({
+                "doc": item.get("doc", ""), "company": item.get("company", ""),
+                "link": item.get("link", ""), "title": "(처리 오류)",
+                "is_cr": False,
+                "content": f"처리 오류: {str(ex)[:200]}",
+                "full_content": "",
+            })
+
         if idx < len(all_results):
-            od.add_page_break()
+            try:
+                od.add_page_break()
+            except Exception:
+                pass
 
     st.session_state.extracted_data = extracted_list
     _build_notebooklm_txt(extracted_list)
@@ -888,10 +973,13 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
             full_text_buffer = []
 
             tbl = od.add_table(rows=4, cols=2, style="Table Grid")
-            tbl.cell(0,0).text, tbl.cell(0,1).text = "Document", e["doc"]
-            tbl.cell(1,0).text, tbl.cell(1,1).text = "Link", e["link"]
-            tbl.cell(2,0).text, tbl.cell(2,1).text = "Company", e["company"]
-            tbl.cell(3,0).text = "Title"
+            _safe_set_cell_text(tbl.cell(0, 0), "Document")
+            _safe_set_cell_text(tbl.cell(0, 1), e["doc"])
+            _safe_set_cell_text(tbl.cell(1, 0), "Link")
+            _safe_set_cell_text(tbl.cell(1, 1), e["link"])
+            _safe_set_cell_text(tbl.cell(2, 0), "Company")
+            _safe_set_cell_text(tbl.cell(2, 1), e["company"])
+            _safe_set_cell_text(tbl.cell(3, 0), "Title")
 
             try:
                 if err or not fp:
@@ -907,7 +995,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     if src_path: break
 
                 if not src_path:
-                    od.add_paragraph("문서 파일을 찾을 수 없습니다 (docx/doc/ppt/pdf).")
+                    _safe_add_paragraph(od, "문서 파일을 찾을 수 없습니다 (docx/doc/ppt/pdf).")
                     log_func(f"{e['doc']} 파일 없음")
                     extracted_list.append({
                         "doc": e["doc"], "company": e["company"], "link": e["link"],
@@ -932,7 +1020,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         text_chunks = re.findall(rb'[\x20-\x7E]{20,}', raw)
                         raw_text = "\n".join(chunk.decode('ascii', errors='ignore') for chunk in text_chunks)
                         if raw_text:
-                            od.add_paragraph(f"[구형 .doc — 텍스트 추출 (서식 없음)]")
+                            _safe_add_paragraph(od, "[구형 .doc — 텍스트 추출 (서식 없음)]")
                             # Conclusion/Summary 부분 찾기
                             lines = raw_text.split('\n')
                             found_conclusion = False
@@ -940,11 +1028,11 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                                 if re.search(r'(?:conclusion|summary)', line, re.I):
                                     found_conclusion = True
                                     for cl in lines[li:li+30]:
-                                        od.add_paragraph(cl)
+                                        _safe_add_paragraph(od, cl)
                                         doc_text_buffer.append(cl)
                                     break
                             if not found_conclusion:
-                                od.add_paragraph("결론 섹션 없음 (구형 .doc)")
+                                _safe_add_paragraph(od, "결론 섹션 없음 (구형 .doc)")
                                 # 전체 텍스트 일부 추출
                                 for cl in lines[-20:]:
                                     doc_text_buffer.append(cl)
@@ -957,10 +1045,10 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                             doc_appended = True
                             log_func(f"{e['doc']} .doc 텍스트 추출")
                         else:
-                            od.add_paragraph("구형 .doc 파일에서 텍스트를 추출할 수 없습니다.")
+                            _safe_add_paragraph(od, "구형 .doc 파일에서 텍스트를 추출할 수 없습니다.")
                             log_func(f"{e['doc']} .doc 텍스트 추출 실패")
                     except Exception as ex:
-                        od.add_paragraph(f"구형 .doc 파일 처리 오류: {ex}")
+                        _safe_add_paragraph(od, f"구형 .doc 파일 처리 오류: {ex}")
                         log_func(f"{e['doc']} .doc 오류: {ex}")
                     # 추출 실패 시에도 placeholder 레코드로 남겨서 downstream(NotebookLM/심층분석)에서 유실 방지
                     if not doc_appended:
@@ -986,10 +1074,10 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                                 if hasattr(shape, "text") and shape.text.strip():
                                     texts.append(shape.text.strip())
                         ppt_text = "\n".join(texts)
-                        od.add_paragraph(f"[PPT 문서 — 슬라이드 텍스트 추출]")
+                        _safe_add_paragraph(od, "[PPT 문서 — 슬라이드 텍스트 추출]")
                         for line in ppt_text.split('\n')[:50]:
                             if line.strip():
-                                od.add_paragraph(line.strip())
+                                _safe_add_paragraph(od, line.strip())
                                 doc_text_buffer.append(line.strip())
                         extracted_list.append({
                             "doc": e["doc"], "company": e["company"], "link": e["link"],
@@ -999,9 +1087,9 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         ppt_appended = True
                         log_func(f"{e['doc']} PPT 추출 완료")
                     except ImportError:
-                        od.add_paragraph("PPT 파싱 라이브러리 없음 (python-pptx)")
+                        _safe_add_paragraph(od, "PPT 파싱 라이브러리 없음 (python-pptx)")
                     except Exception as ex:
-                        od.add_paragraph(f"PPT 처리 오류: {ex}")
+                        _safe_add_paragraph(od, f"PPT 처리 오류: {ex}")
                         log_func(f"{e['doc']} PPT 오류: {ex}")
                     if not ppt_appended:
                         extracted_list.append({
@@ -1025,10 +1113,10 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         finally:
                             pdf_doc.close()
                         pdf_text = "\n".join(pdf_texts)
-                        od.add_paragraph(f"[PDF 문서 — 텍스트 추출]")
+                        _safe_add_paragraph(od, "[PDF 문서 — 텍스트 추출]")
                         for line in pdf_text.split('\n')[:50]:
                             if line.strip():
-                                od.add_paragraph(line.strip())
+                                _safe_add_paragraph(od, line.strip())
                                 doc_text_buffer.append(line.strip())
                         extracted_list.append({
                             "doc": e["doc"], "company": e["company"], "link": e["link"],
@@ -1054,9 +1142,9 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                                 # 2차: 순수 ASCII만
                                 text_chunks = re.findall(rb'[\x20-\x7E]{20,}', raw)
                                 raw_text = "\n".join(c.decode('ascii', errors='ignore') for c in text_chunks)
-                            od.add_paragraph("[PDF — 기본 텍스트 추출]")
+                            _safe_add_paragraph(od, "[PDF — 기본 텍스트 추출]")
                             for line in raw_text.split('\n')[:30]:
-                                od.add_paragraph(line)
+                                _safe_add_paragraph(od, line)
                                 doc_text_buffer.append(line)
                             extracted_list.append({
                                 "doc": e["doc"], "company": e["company"], "link": e["link"],
@@ -1065,9 +1153,9 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                             })
                             pdf_appended = True
                         except Exception as ex:
-                            od.add_paragraph(f"PDF 텍스트 추출 실패: {ex}")
+                            _safe_add_paragraph(od, f"PDF 텍스트 추출 실패: {ex}")
                     except Exception as ex:
-                        od.add_paragraph(f"PDF 처리 오류: {ex}")
+                        _safe_add_paragraph(od, f"PDF 처리 오류: {ex}")
                         log_func(f"{e['doc']} PDF 오류: {ex}")
                     if not pdf_appended:
                         extracted_list.append({
@@ -1089,7 +1177,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                 try:
                     sd = Document(file_path_str)
                 except Exception as ex:
-                    od.add_paragraph(f"문서를 열 수 없습니다 (구형 .doc 파일이거나 손상됨): {ex}")
+                    _safe_add_paragraph(od, f"문서를 열 수 없습니다 (구형 .doc 파일이거나 손상됨): {ex}")
                     log_func(f"{e['doc']} 문서 파싱 에러: {ex}")
                     extracted_list.append({
                         "doc": e["doc"], "company": e["company"], "link": e["link"],
@@ -1163,23 +1251,34 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                 except Exception:
                     pass  # 테이블 파싱 실패해도 일반 문서로 계속 진행
 
-                tbl.cell(3, 1).text = title
+                _safe_set_cell_text(tbl.cell(3, 1), title)
 
                 # CR 문서 처리
                 if is_cr:
-                    od.add_paragraph("📋 [CR — Change Request 문서]").runs[0].bold = True
+                    try:
+                        hdr_para = _safe_add_paragraph(od, "📋 [CR — Change Request 문서]")
+                        if hdr_para.runs:
+                            hdr_para.runs[0].bold = True
+                    except Exception:
+                        pass
                     if cr_reason:
-                        p_label = od.add_paragraph("")
-                        p_label.add_run("Reason for change: ").bold = True
-                        od.add_paragraph(cr_reason)
+                        try:
+                            p_label = od.add_paragraph("")
+                            p_label.add_run(_xml_safe("Reason for change: ")).bold = True
+                        except Exception:
+                            pass
+                        _safe_add_paragraph(od, cr_reason)
                         doc_text_buffer.append(f"Reason for change: {cr_reason}")
                     if cr_summary:
-                        p_label = od.add_paragraph("")
-                        p_label.add_run("Summary of change: ").bold = True
-                        od.add_paragraph(cr_summary)
+                        try:
+                            p_label = od.add_paragraph("")
+                            p_label.add_run(_xml_safe("Summary of change: ")).bold = True
+                        except Exception:
+                            pass
+                        _safe_add_paragraph(od, cr_summary)
                         doc_text_buffer.append(f"Summary of change: {cr_summary}")
                     if not cr_reason and not cr_summary:
-                        od.add_paragraph("CR 테이블에서 Reason/Summary를 추출하지 못했습니다.")
+                        _safe_add_paragraph(od, "CR 테이블에서 Reason/Summary를 추출하지 못했습니다.")
                     log_func(f"{e['doc']} CR 문서 추출 완료")
 
                     extracted_list.append({
@@ -1201,7 +1300,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     if start is not None: break
 
                 if start is None:
-                    od.add_paragraph("결론 섹션 없음")
+                    _safe_add_paragraph(od, "결론 섹션 없음")
                     log_func(f"{e['doc']} 결론없음")
                 else:
                     end = len(paras)
@@ -1211,7 +1310,11 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                                 end = j; break
                         if end < len(paras): break
                     for j in range(start+1, end):
-                        clone_paragraph(paras[j], od)
+                        try:
+                            clone_paragraph(paras[j], od)
+                        except Exception as ex:
+                            # 서식 복제 실패 시에도 텍스트는 보존
+                            _safe_add_paragraph(od, paras[j].text)
                         doc_text_buffer.append(paras[j].text)
                     log_func(f"{e['doc']} 추출 완료")
 
@@ -1222,7 +1325,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     "full_content": ("\n".join(full_text_buffer))[:30000] if full_text_buffer else "원문 텍스트를 추출하지 못했습니다."
                 })
             except Exception as ex:
-                od.add_paragraph(f"오류 - {e['doc']}: {ex}")
+                _safe_add_paragraph(od, f"오류 - {e['doc']}: {ex}")
                 log_func(str(ex))
                 # 예외로 인해 append가 이뤄지지 않았을 수 있으므로 placeholder 추가
                 # (이미 성공 분기에서 append된 경우, 같은 문서가 중복될 수 있지만
@@ -1237,7 +1340,10 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                     })
 
             if idx < len(download_results):
-                od.add_page_break()
+                try:
+                    od.add_page_break()
+                except Exception:
+                    pass
 
         st.session_state.extracted_data = extracted_list
         _build_notebooklm_txt(extracted_list)
@@ -1328,7 +1434,7 @@ def parse_and_summarize(in_bio, status_elem, log_func):
     r.add_heading("Proposal Summary", 0)
 
     if not props:
-        r.add_paragraph("No proposals found.")
+        _safe_add_paragraph(r, "No proposals found.")
         bio = io.BytesIO()
         r.save(bio)
         bio.seek(0)
@@ -1377,9 +1483,9 @@ def parse_and_summarize(in_bio, status_elem, log_func):
 
     status_elem.text("Creating summary...")
     for it in items:
-        r.add_paragraph(it["proposal"])
-        r.add_paragraph(f"Supporting companies ({it['count']}): " + (", ".join(it["companies"]) if it["companies"] else "(none)"))
-        r.add_paragraph("")
+        _safe_add_paragraph(r, it["proposal"])
+        _safe_add_paragraph(r, f"Supporting companies ({it['count']}): " + (", ".join(it["companies"]) if it["companies"] else "(none)"))
+        _safe_add_paragraph(r, "")
 
     bio = io.BytesIO()
     r.save(bio)
@@ -1731,21 +1837,24 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
         # Output 3 docx 생성
         doc = Document()
         doc.add_heading(f"AI 정밀 분석 요약 ({model_display})", 0)
-        doc.add_paragraph(f"분석 대상: {total_docs}개 문서")
-        doc.add_paragraph(f"분석 모델: {model_display} (temperature=0.0)")
-        doc.add_paragraph("")
+        _safe_add_paragraph(doc, f"분석 대상: {total_docs}개 문서")
+        _safe_add_paragraph(doc, f"분석 모델: {model_display} (temperature=0.0)")
+        _safe_add_paragraph(doc, "")
         for line in result_text.split('\n'):
             if re.match(r'^(#+)?\s*\d+\.|^###', line.strip()):
-                p = doc.add_paragraph()
-                # 선두의 # 들만 제거 (본문 중 #1, C# 같은 해시는 보존)
-                cleaned = re.sub(r'^\s*#+\s*', '', line).strip()
-                p.add_run(cleaned).bold = True
+                try:
+                    p = doc.add_paragraph()
+                    # 선두의 # 들만 제거 (본문 중 #1, C# 같은 해시는 보존)
+                    cleaned = re.sub(r'^\s*#+\s*', '', line).strip()
+                    p.add_run(_xml_safe(cleaned)).bold = True
+                except Exception:
+                    _safe_add_paragraph(doc, line)
             elif line.strip().startswith('* **'):
-                doc.add_paragraph(line.strip())
+                _safe_add_paragraph(doc, line.strip())
             elif line.strip().startswith('- [') or line.strip().startswith('- '):
-                doc.add_paragraph(line.strip())
+                _safe_add_paragraph(doc, line.strip())
             else:
-                doc.add_paragraph(line)
+                _safe_add_paragraph(doc, line)
         bio = io.BytesIO()
         doc.save(bio)
         st.session_state.ai_summary_bytes = bio.getvalue()
