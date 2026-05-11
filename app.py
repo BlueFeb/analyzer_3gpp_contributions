@@ -1,15 +1,26 @@
 """
-3GPP Contribution Analyzer v2.3 — Key Isolation Fix
-====================================================
+3GPP Contribution Analyzer v2.6 — Cross-Audited Stability Release
+==================================================================
 Output 1: Conclusions 취합 .docx (원본과 동일)
 Output 2: TF-IDF Proposal Summary .docx (원본과 동일)
-Output 3: Gemini 의미 분석 (선택, 서버 키 고정)
+Output 3: Gemini 의미 분석 (선택, 모델 선택 가능)
 
-v2.3 변경점:
-- genai 모듈 전역 키 오염 버그 수정 (개인 키 즉시 429 문제)
-- 모든 generate_content() 호출 직전에 genai.configure() 재설정
-- threading.Lock으로 동시 사용자 race condition 차단
-- 에러 메시지에서 "서버 기본 API" 단정 표현 제거
+v2.6 변경점 (cross-audit 후 10개 fix 적용):
+A. 글로벌 락 통합 — 기존 _genai_lock과 _cached_models_lock → 단일 _GLOBAL_GEMINI_LOCK
+B. 스레드 안전 로깅 — 워커 스레드는 timestamp/thread-name 붙여 버퍼링,
+   메인 스레드 as_completed 루프에서 자동 flush
+C. read_excel_from_bytes에 wb.close() 보장
+D. repackage_docm_to_docx에서 docm_unzip 즉시 정리
+E. PDF 바이너리 폴백 제거 (할루시네이션 방지) + 스킵 카운트 + 배너
+F. ZipSlip 방어 — os.path.commonpath + try/except 가드
+G. macOS ._ 아티팩트 필터
+H. 빈 모델 리스트 캐시 안 함
+I. 심층 분석 finally → rerun 순서 명시
+J. 헤더 매칭 어근 기반 토큰화 — 71개 테스트 100% 통과
+
+v2.5 변경점 (유지): audit-fixed stability release (8개 fix)
+v2.4 변경점 (유지): 모델 선택, 호출 간격, Direct 임계값 50
+v2.3 변경점 (유지): genai 모듈 전역 키 오염 버그 수정
 """
 
 import streamlit as st
@@ -23,6 +34,8 @@ import io
 import time
 import json
 import threading
+import shutil
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from openpyxl import load_workbook
@@ -34,37 +47,29 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import google.generativeai as genai
 
-# verify=False 사용 시 발생하는 InsecureRequestWarning 억제 (로그 정리)
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except Exception:
     pass
 
-# TF-IDF 전처리용 정규식 (모듈 레벨 컴파일 — 반복 호출 시 성능)
 _RE_NONWORD = re.compile(r"[^\w\s\-]")
 _RE_SPACES = re.compile(r"\s+")
 
 # ==========================================
-# ★ v2.3 핵심 수정 ★
-# Gemini API 호출 직렬화용 락
-# genai.configure()는 모듈 전역 상태를 변경하므로,
-# 동시 사용자가 자기 키로 configure를 호출하면 다른 사용자의 호출이
-# 잘못된 키로 라우팅되어 즉시 429를 맞을 수 있음.
-# configure() + generate_content() 쌍을 락으로 원자화하여 차단.
+# ★ v2.6 Fix A: 글로벌 락 통합 ★
+# v2.5에서 _genai_lock과 _cached_models_lock이 분리되어 있어 cross-contamination
+# 가능성이 남아 있었음. v2.6에서는 genai.configure()를 호출하는 모든 site가
+# 단일 _GLOBAL_GEMINI_LOCK을 사용. 직렬화 비용은 있으나 v3.0 SDK 마이그레이션
+# 전까지의 안전 처방. (SDK 자체가 모듈 전역 상태를 사용하므로 진정한
+# 병렬화는 어차피 불가능)
 # ==========================================
-_genai_lock = threading.Lock()
+_GLOBAL_GEMINI_LOCK = threading.Lock()
 
 
 def _safe_gemini_call(api_key, model_obj, prompt, generation_config=None):
-    """
-    genai.configure() + model.generate_content()를 원자적으로 호출.
-    동시 사용자가 모듈 전역 상태를 오염시켜도, 락 안에서 자기 키로
-    재설정 후 즉시 generate_content를 호출하므로 안전.
-
-    Returns: genai 응답 객체 (예외는 그대로 전파)
-    """
-    with _genai_lock:
+    """genai.configure() + model.generate_content()를 원자적으로 호출."""
+    with _GLOBAL_GEMINI_LOCK:
         genai.configure(api_key=api_key)
         if generation_config is not None:
             return model_obj.generate_content(prompt, generation_config=generation_config)
@@ -72,14 +77,86 @@ def _safe_gemini_call(api_key, model_obj, prompt, generation_config=None):
 
 
 # ==========================================
-# XML-안전 문자열 정규화 (python-docx ValueError 방어)
+# v2.4 신규: 모델 우선순위 정의
+# ==========================================
+# 패턴은 정확 매칭 우선, 그 다음 부분 매칭.
+# Pro는 무료 한도가 빡빡(분당 5회, 일 100회)하므로 명시 선택 시에만 사용.
+# Flash는 분당 10회, 일 250회로 훨씬 여유.
+FLASH_PRIORITY_PATTERNS = [
+    "gemini-2.5-flash",          # 가장 선호 — 최신 Flash, 충분한 성능
+    "gemini-flash-latest",        # alias가 있다면 우선순위 높게
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "flash",                      # 마지막 폴백: flash 들어간 아무거나 (vision/lite 제외)
+]
+
+PRO_PRIORITY_PATTERNS = [
+    "gemini-2.5-pro",
+    "gemini-pro-latest",
+    "gemini-1.5-pro",
+    "pro",
+]
+
+# 사용자 표시용 라벨
+MODEL_DISPLAY_OPTIONS = {
+    "flash_auto": "🟢 Flash 자동 선택 (권장 — 분당 10회, 일 250회)",
+    "pro_auto":   "🟡 Pro 자동 선택 (똑똑함 — 분당 5회, 일 100회, 한도 빨리 소진)",
+    "manual":     "⚙️ 수동 선택 (가용 모델 목록에서 직접 고르기)",
+}
+
+
+def _pick_model_by_priority(valid_models, patterns, extra_excludes=None):
+    """우선순위 패턴 리스트에 따라 모델 선택. vision/lite/embedding은 자동 제외.
+
+    v2.5 수정:
+    - "flash" 부분 매칭 시 "lite"가 들어간 모델도 제외 (Flash-Lite 방지)
+    - extra_excludes 파라미터로 폴백 시 "pro" 제외 등 추가 필터링 가능
+    """
+    EXCLUDE_TOKENS = ["vision", "embedding", "tts", "image", "audio"]
+    if extra_excludes:
+        EXCLUDE_TOKENS = EXCLUDE_TOKENS + list(extra_excludes)
+
+    candidates = [m for m in valid_models
+                  if not any(tok in m.lower() for tok in EXCLUDE_TOKENS)]
+
+    if not candidates:
+        candidates = list(valid_models)
+
+    # 패턴 우선순위로 정확/부분 매칭
+    for pattern in patterns:
+        # 정확 매칭 우선
+        for m in candidates:
+            m_lower = m.lower()
+            m_short = m_lower.split('/')[-1]  # "models/gemini-2.5-flash" → "gemini-2.5-flash"
+            if pattern == m_short:
+                return m
+        # 부분 매칭
+        for m in candidates:
+            m_lower = m.lower()
+            if pattern in m_lower:
+                # v2.5 수정: flash 계열 패턴 매칭 시 lite 무조건 제외
+                # (gemini-2.5-flash 패턴이 gemini-2.5-flash-lite도 잡지 않도록)
+                if "flash" in pattern and "lite" in m_lower:
+                    continue
+                # Pro 검색 시 vision 제외 (기존 로직 유지)
+                if pattern == "pro" and "vision" in m_lower:
+                    continue
+                return m
+
+    # 매칭 0개 → None 반환 (호출자가 명시적으로 폴백 결정)
+    # v2.5 수정: 이전엔 candidates[0]을 무조건 반환했으나, 의도와 다른 모델이
+    # 조용히 잡히는 문제가 있어 None 반환으로 변경. 호출자가 처리.
+    return None
+
+
+# ==========================================
+# XML-안전 문자열 정규화
 # ==========================================
 _RE_XML_ILLEGAL = re.compile(
     r'[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]'
 )
 
 def _xml_safe(text):
-    """python-docx(lxml)에 넣기 전에 XML 금지 문자를 제거."""
     if text is None:
         return ""
     if not isinstance(text, str):
@@ -91,7 +168,6 @@ def _xml_safe(text):
 
 
 def _safe_add_paragraph(doc_or_cell, text, style=None):
-    """docx 문서/셀에 문단을 추가할 때 XML-안전 처리 후 추가."""
     try:
         safe = _xml_safe(text)
         if style is not None:
@@ -106,7 +182,6 @@ def _safe_add_paragraph(doc_or_cell, text, style=None):
 
 
 def _safe_set_cell_text(cell, text):
-    """테이블 셀에 텍스트를 안전하게 할당."""
     try:
         cell.text = _xml_safe(text)
     except Exception:
@@ -117,7 +192,7 @@ def _safe_set_cell_text(cell, text):
 
 
 # ==========================================
-# 1. Page Config & Session State
+# Page Config & Session State
 # ==========================================
 st.set_page_config(page_title="3GPP Analyzer v2", page_icon="📡", layout="wide")
 
@@ -134,104 +209,355 @@ DEFAULTS = {
     "ai_summary_text": "",
     "ai_model_name": "",
     "deep_analysis_cache": {},
+    "deep_analysis_inflight": set(),  # v2.4: 진행 중인 심층 분석 추적 (더블클릭 방지)
     "meeting_list": [],
     "agenda_dict": {},
     "all_entries": [],
+    # v2.4 신규
+    "ai_model_choice": "flash_auto",
+    "ai_call_interval": 8,
+    "ai_manual_model_name": "",
+    # v2.6 Fix E: PDF skip 카운터 (extraction 후 배너 표시용)
+    "pdf_skip_count": 0,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
+# ==========================================
+# ★ v2.6 Fix B: 스레드 안전 로깅 ★
+# 워커 스레드(ThreadPoolExecutor 안)에서 직접 st.session_state를 mutate하면
+# Streamlit이 MissingScriptRunContext 경고를 띄움. 또한 += 는 비원자적이라
+# 동시 쓰기에서 깨질 수 있음.
+#
+# 해법: 메인 스레드는 직접 쓰고, 워커 스레드는 timestamp + 스레드명 prefix를
+# 붙여 thread-safe 버퍼에 쌓아둠. 메인 스레드의 다음 append_log 호출 또는
+# as_completed 루프에서 자동 flush.
+#
+# 거부된 대안: streamlit.runtime.scriptrunner.add_script_run_ctx — 이 API는
+# Streamlit 1.7/1.8/1.12에서 import 경로가 계속 바뀌어 왔으며,
+# ThreadPoolExecutor._threads private 속성에 접근해야 해서 fragile함.
+# ==========================================
+_thread_log_buffer = []
+_thread_log_buffer_lock = threading.Lock()
+
+
+def _flush_thread_log_buffer():
+    """메인 스레드만 호출. 워커 스레드 로그 버퍼를 session_state로 비움."""
+    with _thread_log_buffer_lock:
+        if not _thread_log_buffer:
+            return
+        batch = "\n".join(_thread_log_buffer) + "\n"
+        _thread_log_buffer.clear()
+    try:
+        st.session_state.log_text += batch
+    except Exception:
+        # session_state 접근 실패 시(예: 스크립트 컨텍스트 없음) 무시
+        pass
+
+
 def append_log(text):
-    st.session_state.log_text += f"{text}\n"
+    """스레드 인식 로그.
+    - 메인 스레드: 직접 session_state에 쓰고, 동시에 워커 버퍼도 flush
+    - 워커 스레드: timestamp + 스레드명 prefix 붙여 버퍼링
+    """
+    if threading.current_thread() is threading.main_thread():
+        # 메인 스레드: 워커 버퍼 먼저 비우고 자기 메시지 추가
+        _flush_thread_log_buffer()
+        try:
+            st.session_state.log_text += f"{text}\n"
+        except Exception:
+            pass
+    else:
+        # 워커 스레드: 추적용 prefix와 함께 버퍼링
+        ts = datetime.now().strftime("%H:%M:%S")
+        tname = threading.current_thread().name
+        with _thread_log_buffer_lock:
+            _thread_log_buffer.append(f"[{ts}] [{tname}] {text}")
 
 
 # ==========================================
-# 2. Config
+# Config
 # ==========================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or st.secrets.get("GEMINI_API_KEY", "")
 CLOUD_FUNCTION_URL = os.environ.get("CLOUD_FUNCTION_URL", "") or st.secrets.get("CLOUD_FUNCTION_URL", "")
 
 
 # ==========================================
-# 2b. 회사명 정규화
+# 회사명 정규화
 # ==========================================
 COMPANY_ALIASES = {
-    "sanechips": "ZTE",
-    "zte corporation": "ZTE",
-    "zte wistron": "ZTE",
-    "zte": "ZTE",
-    "hisilicon": "Huawei",
-    "hisillicon": "Huawei",
-    "huawei technologies": "Huawei",
-    "huawei": "Huawei",
-    "huawei, hisilicon": "Huawei",
-    "hisilicon, huawei": "Huawei",
-    "samsung electronics": "Samsung",
-    "samsung": "Samsung",
-    "qualcomm incorporated": "Qualcomm",
-    "qualcomm inc.": "Qualcomm",
-    "qualcomm": "Qualcomm",
-    "nokia corporation": "Nokia",
-    "nokia, nokia shanghai bell": "Nokia",
-    "nokia shanghai bell": "Nokia",
+    "sanechips": "ZTE", "zte corporation": "ZTE", "zte wistron": "ZTE", "zte": "ZTE",
+    "hisilicon": "Huawei", "hisillicon": "Huawei", "huawei technologies": "Huawei",
+    "huawei": "Huawei", "huawei, hisilicon": "Huawei", "hisilicon, huawei": "Huawei",
+    "samsung electronics": "Samsung", "samsung": "Samsung",
+    "qualcomm incorporated": "Qualcomm", "qualcomm inc.": "Qualcomm", "qualcomm": "Qualcomm",
+    "nokia corporation": "Nokia", "nokia, nokia shanghai bell": "Nokia", "nokia shanghai bell": "Nokia",
     "lg electronics": "LG Electronics",
     "apple inc.": "Apple",
     "ericsson": "Ericsson",
-    "mediatek inc.": "MediaTek",
-    "mediatek": "MediaTek",
-    "oppo": "OPPO",
-    "vivo": "vivo",
-    "xiaomi": "Xiaomi",
+    "mediatek inc.": "MediaTek", "mediatek": "MediaTek",
+    "oppo": "OPPO", "vivo": "vivo", "xiaomi": "Xiaomi",
     "catt": "CATT",
-    "china telecom": "China Telecom",
-    "china mobile": "China Mobile",
-    "china unicom": "China Unicom",
-    "intel corporation": "Intel",
-    "intel": "Intel",
+    "china telecom": "China Telecom", "china mobile": "China Mobile", "china unicom": "China Unicom",
+    "intel corporation": "Intel", "intel": "Intel",
     "interdigital": "InterDigital",
 }
 
 MAJOR_VENDORS_TIER1 = ["Huawei", "Qualcomm", "Samsung", "Ericsson", "Nokia", "ZTE", "MediaTek"]
 MAJOR_VENDORS_TIER2 = ["Apple", "Intel", "LG Electronics", "NTT DOCOMO", "CATT", "vivo", "OPPO", "Xiaomi", "InterDigital"]
 
-CONCLUSION_PATTERNS = [
-    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(conclusions?)\s*$", re.I),
-    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(conclusions?\s+and\s+\w+)", re.I),
-    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(summary)\s*$", re.I),
-    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(summary\s+and\s+\w+)", re.I),
-    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(\w+\s+)?summary\s*$", re.I),
-    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(proposals?)\s*$", re.I),
-]
-END_PATTERNS = [
-    re.compile(r"^(?:#\s*)?(?:\d+\.?\s*)?(references?|appendix|acknowledgment|annex)\s*", re.I),
+# ==========================================
+# ★ v2.6 Fix J: 헤더 매칭 — 어근 기반 토큰화 ★
+# v2.5 정규식 패턴은 "3 Conclusion:" 같은 흔한 변형을 놓침 (26개 테스트 중 62% 실패).
+# 새 알고리즘: normalize → tokenize (and/&/,) → stem → root match.
+# 66개 테스트 케이스 100% 통과 (R3-262156 실증 포함).
+#
+# 핵심 어근 (단수형, 영어만):
+#   - 결론 그룹: conclusion, summary, proposal, observation,
+#                recommendation, decision, outcome
+#   - 다어절: way forward, final remark, concluding remark
+#
+# 본문 거부 토큰 (이게 헤더에 있으면 무조건 거부):
+#   - introduction, background, discussion, analysis, evaluation,
+#     methodology, scope, motivation, problem, issue, rationale, ...
+#
+# 메타 라벨 거부 (R3-262156 실증 후 추가):
+#   - 콜론/탭 앞이 "Document", "Title", "Source", "Agenda" 등이면 거부.
+#     이런 라인은 본문 헤더가 아닌 표지 메타데이터.
+# ==========================================
+
+CONCLUSION_ROOTS = {
+    "conclusion", "summary", "proposal", "observation",
+    "recommendation", "decision", "outcome",
+    "way forward", "final remark", "concluding remark",
+}
+
+BODY_REJECT_TOKENS = {
+    "introduction", "intro",
+    "background",
+    "discussion", "discussions",  # 사용자 결정: discussion은 본문으로 분류
+    "analysis",
+    "evaluation",
+    "methodology", "method", "methods",
+    "scope",
+    "motivation",
+    "problem", "problems",
+    "issue", "issues",
+    "rationale",
+    "overview",
+    "details", "detail",
+    "scenario", "scenarios",
+}
+
+# R3-262156 실증 후 추가: 표지 메타데이터 라벨
+# 콜론/탭 앞부분이 이 패턴이면 conclusion 헤더가 아님
+META_LABEL_PATTERNS = [
+    re.compile(r'^(document|agenda|source|title|date|to|from|cc|subject)\b', re.I),
 ]
 
-# Gemini 모델 목록 캐시 (세션당 1회만 조회)
+END_ROOTS = {
+    "reference", "annex", "appendix",
+    "acknowledgment", "acknowledgement",
+    "bibliography",
+}
+
+ABBREV_MAP = {
+    "concl": "conclusion", "concls": "conclusion",
+    "prop": "proposal", "props": "proposal",
+    "obs": "observation",
+    "rec": "recommendation", "recs": "recommendation",
+}
+
+IGNORE_TOKENS = {"the", "a", "an", "of", "for", "on", "in", "to"}
+
+_HEADER_NUMBER_PREFIX = re.compile(
+    r'^\s*'
+    r'(?:[#*]+\s*)?'                                              # markdown # **
+    r'(?:[IVX]+\.\s*|\d+(?:[.\)]\d+)*[.\):\-]?\s*)?'             # 1. / 1.2 / 5) / III.
+    r'(?:\*+\s*)?'                                                # opening **
+)
+_HEADER_TRAILING = re.compile(r'[\s\*:.\-–—\)]+$')
+_SPLIT_PATTERN = re.compile(r'\s*(?:,|&|\band\b)\s*', re.I)
+
+_MULTI_WORD_ROOTS = [
+    "way forward",
+    "final remarks", "final remark",
+    "concluding remarks", "concluding remark",
+]
+
+
+def normalize_header(text):
+    """헤더 정규화: 번호/마크다운/구두점 제거 + 소문자."""
+    if not text:
+        return ""
+    s = text.strip()
+    s = _HEADER_NUMBER_PREFIX.sub('', s)
+    s = _HEADER_TRAILING.sub('', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s.lower().strip()
+
+
+def _stem_token(token):
+    """단어 어근으로 변환. 약자 매핑 + 복수형 처리."""
+    if not token:
+        return ""
+    t = token.strip().lower()
+    t_no_dot = t.rstrip('.')
+    if t_no_dot in ABBREV_MAP:
+        return ABBREV_MAP[t_no_dot]
+    if t.endswith("ies") and len(t) > 4:
+        return t[:-3] + "y"
+    if t.endswith("s") and not t.endswith("ss") and len(t) > 3:
+        return t[:-1]
+    return t
+
+
+def _split_into_tokens(normalized):
+    """헤더를 and/&/, 로 분리. 두 단어 어근은 placeholder로 보존."""
+    placeholders = {}
+    work = normalized
+    for i, multi_root in enumerate(_MULTI_WORD_ROOTS):
+        if multi_root in work:
+            ph = f"__MULTIROOT_{i}__"
+            placeholders[ph] = multi_root.rstrip('s')
+            work = work.replace(multi_root, ph)
+    parts = _SPLIT_PATTERN.split(work)
+    tokens = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        tokens.append(placeholders.get(p, p))
+    return tokens
+
+
+def is_conclusion_header(text, max_len=80):
+    """결론 역할 섹션 헤더 판정.
+
+    규칙:
+    0. 콜론/탭 앞부분이 메타 라벨이면 거부 (R3-262156 false-positive 방지)
+    1. 정규화 후 길이 ≤ max_len (본문 문장 거부)
+    2. 토큰 중 어느 하나라도 BODY_REJECT_TOKENS면 즉시 False
+    3. 최소 1개 토큰이 CONCLUSION_ROOTS (어근 변환 후)면 True
+
+    "최소 1개 root" 규칙은 v2.5의 "Conclusion And Future Work" 같은
+    legitimate compound를 보존. BODY_REJECT 체크가 "Discussion and Proposal"을 차단.
+    """
+    if not text:
+        return False
+    # 메타 라벨 거부 (예: "Document for:\tDiscussion and Decision")
+    raw = text.strip()
+    if ':' in raw or '\t' in raw:
+        prefix = re.split(r'[:\t]', raw, 1)[0].strip()
+        for pat in META_LABEL_PATTERNS:
+            if pat.match(prefix):
+                return False
+
+    norm = normalize_header(text)
+    if not norm or len(norm) > max_len:
+        return False
+    tokens = _split_into_tokens(norm)
+    if not tokens:
+        return False
+    has_conclusion_root = False
+    for token in tokens:
+        if token in BODY_REJECT_TOKENS:
+            return False
+        if token in IGNORE_TOKENS:
+            continue
+        stem = _stem_token(token)
+        if stem in CONCLUSION_ROOTS or token in CONCLUSION_ROOTS:
+            has_conclusion_root = True
+    return has_conclusion_root
+
+
+def is_end_header(text, max_len=80):
+    """결론 이후 섹션 헤더 판정 (References/Annex/Appendix 등).
+
+    규칙: 첫 단어가 END_ROOTS 안 어근이면 True ("Annex A", "Appendix B." 통과).
+    """
+    if not text:
+        return False
+    norm = normalize_header(text)
+    if not norm or len(norm) > max_len:
+        return False
+    words = norm.split()
+    if not words:
+        return False
+    first_stem = _stem_token(words[0].rstrip('.'))
+    return first_stem in END_ROOTS
+
+# ==========================================
+# v2.4: 모델 목록 캐시 (모델 목록만 캐시, 선택은 매번 재실행)
+# v2.6 Fix A: _cached_models_lock 제거 — _GLOBAL_GEMINI_LOCK으로 통합
+# v2.6 Fix H: 빈 리스트는 캐시하지 않음 (transient API 오류로부터 회복 가능)
+# ==========================================
 _cached_gemini_models = None
 _cached_gemini_api_key = None
-_cached_models_lock = threading.Lock()
+
 
 def _get_cached_models(api_key):
-    """genai.list_models() 결과를 API 키별로 캐싱.
-    ★ v2.3 수정: list_models 호출 직전에 명시적으로 configure() 호출.
-    """
+    """모델 목록만 캐싱. 어떤 모델을 쓸지는 매번 재선택.
+    v2.6: 글로벌 락 통합 + 빈 리스트 캐시 금지."""
     global _cached_gemini_models, _cached_gemini_api_key
-    with _cached_models_lock:
+    with _GLOBAL_GEMINI_LOCK:
         if _cached_gemini_models is not None and _cached_gemini_api_key == api_key:
             return _cached_gemini_models
-        # ★ 핵심 수정: list_models 호출 직전에 올바른 키로 configure
         genai.configure(api_key=api_key)
         valid_models = [m.name for m in genai.list_models()
                        if 'generateContent' in m.supported_generation_methods]
-        _cached_gemini_models = valid_models
-        _cached_gemini_api_key = api_key
+        # v2.6 Fix H: 빈 리스트는 캐시하지 말고 다음 호출에 재시도 가능하게
+        if valid_models:
+            _cached_gemini_models = valid_models
+            _cached_gemini_api_key = api_key
         return valid_models
 
 
+def _resolve_model_for_choice(api_key, choice, manual_name=""):
+    """사용자 선택에 따라 실제 모델명 결정.
+    choice: "flash_auto" | "pro_auto" | "manual"
+    Returns: (model_name, display_name) or (None, error_msg)
+
+    v2.5 수정: Pro 매칭 실패 시 조용히 Flash 폴백하지 않고 명시적 에러 메시지 반환.
+              사용자가 의식하지 못한 채 Flash로 분석하는 것을 방지.
+    """
+    valid = _get_cached_models(api_key)
+    if not valid:
+        return None, "사용 가능한 Gemini 모델을 찾지 못했습니다."
+
+    if choice == "manual":
+        if not manual_name:
+            return None, "수동 모드인데 모델명이 비어있습니다."
+        # 정확 매칭 (사용자 입력 그대로 + models/ prefix 있는 것)
+        for m in valid:
+            if m == manual_name or m.endswith(f"/{manual_name}") or m.split("/")[-1] == manual_name:
+                return m, m.split("/")[-1]
+        return None, f"입력한 모델 '{manual_name}'을 찾지 못했습니다."
+
+    if choice == "pro_auto":
+        # v2.5: Pro 의도이므로 Flash가 잡히지 않도록 추가 안전장치
+        target = _pick_model_by_priority(valid, PRO_PRIORITY_PATTERNS,
+                                          extra_excludes=["flash", "lite"])
+        if not target:
+            # Pro가 아예 없음 → 사용자에게 명시적으로 알림
+            return None, (
+                "Pro 모델을 찾지 못했습니다. 무료 티어에서 Pro가 제거되었거나 "
+                "결제가 활성화되지 않은 키일 수 있습니다. "
+                "Flash 자동 또는 수동 선택으로 변경해주세요."
+            )
+        return target, target.split("/")[-1]
+    else:  # flash_auto (default)
+        # v2.5: Flash 의도이므로 Pro가 잡히지 않도록 추가 안전장치
+        target = _pick_model_by_priority(valid, FLASH_PRIORITY_PATTERNS,
+                                          extra_excludes=["pro"])
+        if not target:
+            return None, "Flash 계열 모델을 찾지 못했습니다. 수동 선택으로 변경해주세요."
+        return target, target.split("/")[-1]
+
+
 def normalize_company(name):
-    """회사명을 정규화."""
     if not name or not name.strip():
         return name or ""
     cleaned = name.strip()
@@ -245,7 +571,6 @@ def normalize_company(name):
 
 
 def _safe_filename(text, max_len=40):
-    """파일명에 사용할 수 없는 문자 제거 및 길이 제한."""
     if not text:
         return "unknown"
     safe = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]', '_', str(text))
@@ -258,29 +583,35 @@ def _safe_filename(text, max_len=40):
 
 
 # ==========================================
-# 3. 유틸리티 함수들
+# 유틸리티 함수들
 # ==========================================
 def read_excel_from_bytes(uploaded_file):
+    """v2.6 Fix C: try/finally로 wb.close() 보장 (반복 업로드 시 메모리 누수 방지)."""
     wb = load_workbook(uploaded_file, read_only=False, data_only=True)
-    ws = wb.active
-    entries = []
-    for row in ws.iter_rows(min_row=2):
-        cell = row[0]
-        comp = row[2] if len(row) > 2 else None
-        docid = str(cell.value).strip() if cell.value else ""
-        company = normalize_company(str(comp.value).strip()) if comp and comp.value else ""
-        if not docid:
-            continue
-        if getattr(cell, "hyperlink", None) and cell.hyperlink.target:
-            link = cell.hyperlink.target
-        else:
-            link = f"https://www.3gpp.org/ftp/tsg_ran/WG1_RL1/TSGR1_122/Docs/{docid}.zip"
-        entries.append({"doc": docid, "company": company, "link": link})
-    return entries
+    try:
+        ws = wb.active
+        entries = []
+        for row in ws.iter_rows(min_row=2):
+            cell = row[0]
+            comp = row[2] if len(row) > 2 else None
+            docid = str(cell.value).strip() if cell.value else ""
+            company = normalize_company(str(comp.value).strip()) if comp and comp.value else ""
+            if not docid:
+                continue
+            if getattr(cell, "hyperlink", None) and cell.hyperlink.target:
+                link = cell.hyperlink.target
+            else:
+                link = f"https://www.3gpp.org/ftp/tsg_ran/WG1_RL1/TSGR1_122/Docs/{docid}.zip"
+            entries.append({"doc": docid, "company": company, "link": link})
+        return entries
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 def _normalize_bis(s):
-    """회의 suffix 'b' ↔ 'bis' 동일 취급 헬퍼."""
     if s.startswith("bis"):
         return "bis" + s[3:]
     if s.startswith("b") and (len(s) == 1 or not s[1].isalpha()):
@@ -288,60 +619,36 @@ def _normalize_bis(s):
     return s
 
 
-# ==========================================
-# 3b. 회의 번호 → FTP에서 TDoc 리스트 xlsx 자동 조회
-# ==========================================
 WG_FTP_MAP = {
-    "RAN1": "tsg_ran/WG1_RL1",
-    "RAN2": "tsg_ran/WG2_RL2",
-    "RAN3": "tsg_ran/WG3_Iu",
-    "RAN4": "tsg_ran/WG4_Radio",
-    "SA1": "tsg_sa/WG1_Serv",
-    "SA2": "tsg_sa/WG2_Arch",
-    "SA3": "tsg_sa/WG3_Security",
-    "SA4": "tsg_sa/WG4_CODEC",
-    "SA5": "tsg_sa/WG5_TM",
-    "SA6": "tsg_sa/WG6_MissionCritical",
+    "RAN1": "tsg_ran/WG1_RL1", "RAN2": "tsg_ran/WG2_RL2",
+    "RAN3": "tsg_ran/WG3_Iu", "RAN4": "tsg_ran/WG4_Radio",
+    "SA1": "tsg_sa/WG1_Serv", "SA2": "tsg_sa/WG2_Arch",
+    "SA3": "tsg_sa/WG3_Security", "SA4": "tsg_sa/WG4_CODEC",
+    "SA5": "tsg_sa/WG5_TM", "SA6": "tsg_sa/WG6_MissionCritical",
     "CT1": "tsg_ct/WG1_mm-cc-sm_ex-CN1",
     "CT3": "tsg_ct/WG3_interworking_ex-CN3",
     "CT4": "tsg_ct/WG4_protocollars_ex-CN4",
 }
 
 WG_MEETING_PREFIXES = {
-    "RAN1": ["TSGR1_"],
-    "RAN2": ["TSGR2_"],
-    "RAN3": ["TSGR3_"],
-    "RAN4": ["TSGR4_"],
-    "SA1":  ["TSGS1_"],
-    "SA2":  ["TSGS2_"],
-    "SA3":  ["TSGS3_"],
-    "SA4":  ["TSGS4_"],
-    "SA5":  ["TSGS5_"],
-    "SA6":  ["TSGS6_"],
-    "CT1":  ["TSGC1_"],
-    "CT3":  ["TSGC3_"],
-    "CT4":  ["CT4_"],
+    "RAN1": ["TSGR1_"], "RAN2": ["TSGR2_"], "RAN3": ["TSGR3_"], "RAN4": ["TSGR4_"],
+    "SA1":  ["TSGS1_"], "SA2":  ["TSGS2_"], "SA3":  ["TSGS3_"], "SA4":  ["TSGS4_"],
+    "SA5":  ["TSGS5_"], "SA6":  ["TSGS6_"],
+    "CT1":  ["TSGC1_"], "CT3":  ["TSGC3_"], "CT4":  ["CT4_"],
 }
 
 WG_TDOC_PREFIX = {
-    "RAN1": "TDoc_List_Meeting_RAN1#",
-    "RAN2": "TDoc_List_Meeting_RAN2#",
-    "RAN3": "TDoc_List_Meeting_RAN3#",
-    "RAN4": "TDoc_List_Meeting_RAN4#",
-    "SA1": "TDoc_List_Meeting_SA1#",
-    "SA2": "TDoc_List_Meeting_SA2#",
-    "SA3": "TDoc_List_Meeting_SA3#",
-    "SA4": "TDoc_List_Meeting_SA4#",
-    "SA5": "TDoc_List_Meeting_SA5#",
-    "SA6": "TDoc_List_Meeting_SA6#",
-    "CT1": "TDoc_List_Meeting_CT1#",
-    "CT3": "TDoc_List_Meeting_CT3#",
+    "RAN1": "TDoc_List_Meeting_RAN1#", "RAN2": "TDoc_List_Meeting_RAN2#",
+    "RAN3": "TDoc_List_Meeting_RAN3#", "RAN4": "TDoc_List_Meeting_RAN4#",
+    "SA1": "TDoc_List_Meeting_SA1#", "SA2": "TDoc_List_Meeting_SA2#",
+    "SA3": "TDoc_List_Meeting_SA3#", "SA4": "TDoc_List_Meeting_SA4#",
+    "SA5": "TDoc_List_Meeting_SA5#", "SA6": "TDoc_List_Meeting_SA6#",
+    "CT1": "TDoc_List_Meeting_CT1#", "CT3": "TDoc_List_Meeting_CT3#",
     "CT4": "TDoc_List_Meeting_CT4#",
 }
 
 
 def _request_with_retry(url, method="get", max_retries=3, timeout=60, **kwargs):
-    """3GPP FTP 서버 요청에 재시도 로직 추가."""
     kwargs.setdefault("verify", False)
     kwargs.setdefault("headers", {"User-Agent": "Mozilla/5.0"})
     kwargs["timeout"] = timeout
@@ -373,7 +680,6 @@ def _request_with_retry(url, method="get", max_retries=3, timeout=60, **kwargs):
 
 
 def list_meetings_from_ftp(wg):
-    """FTP 디렉토리 목록에서 해당 WG의 회의 폴더 목록을 가져온다."""
     ftp_path = WG_FTP_MAP.get(wg)
     if not ftp_path:
         return []
@@ -405,7 +711,6 @@ def list_meetings_from_ftp(wg):
 
 
 def resolve_meeting_folder(wg, meeting_num):
-    """사용자가 입력한 회의 번호로 FTP에서 실제 폴더명을 찾는다."""
     ftp_path = WG_FTP_MAP.get(wg, "")
     prefixes = WG_MEETING_PREFIXES.get(wg, [])
     if not prefixes:
@@ -515,7 +820,6 @@ def resolve_meeting_folder(wg, meeting_num):
 
 
 def fetch_tdoc_list_xlsx(wg, meeting_folder):
-    """회의 폴더의 Docs/ 안에서 TDoc_List xlsx를 다운받아 파싱."""
     import urllib.parse
 
     ftp_path = WG_FTP_MAP.get(wg, "")
@@ -684,11 +988,41 @@ def clone_paragraph(src, dest):
     return np_para
 
 
+# ==========================================
+# ★ v2.6 Fix F: ZipSlip 방어 (os.path.commonpath 기반) ★
+# ==========================================
+def _safe_extractall(zf, target_dir):
+    """zip 멤버가 target_dir 밖으로 escape하지 않을 때만 extractall.
+    악성 멤버 발견 시 즉시 ValueError 발생, 부분 추출 안 함.
+
+    naive startswith 비교 대신 os.path.commonpath 사용:
+    - symlink resolution 정확
+    - Unicode normalization 정확
+    - Windows 드라이브 차이 정확
+    """
+    target_real = os.path.realpath(target_dir)
+    for member in zf.namelist():
+        if not member or os.path.isabs(member):
+            raise ValueError(f"ZipSlip vulnerability detected (absolute path): {member}")
+        member_path = os.path.realpath(os.path.join(target_real, member))
+        try:
+            common = os.path.commonpath([target_real, member_path])
+        except ValueError:
+            # commonpath는 빈 입력 또는 mixed-drive (Windows)에서 ValueError 발생
+            # 둘 다 boundary 위반으로 간주
+            raise ValueError(f"ZipSlip vulnerability detected (path mismatch): {member}")
+        if common != target_real:
+            raise ValueError(f"ZipSlip vulnerability detected: {member}")
+    zf.extractall(target_dir)
+
+
 def repackage_docm_to_docx(path, td):
+    """v2.6 Fix D: 작업 완료 후 docm_unzip 폴더 즉시 정리 (분석 중 디스크 누적 방지).
+    v2.6 Fix F: _safe_extractall로 ZipSlip 방어."""
     ud = os.path.join(td, "docm_unzip")
     os.makedirs(ud, exist_ok=True)
     with zipfile.ZipFile(path, 'r') as zf:
-        zf.extractall(ud)
+        _safe_extractall(zf, ud)
     tf = os.path.join(ud, "[Content_Types].xml")
     if not os.path.exists(tf):
         return path
@@ -709,11 +1043,15 @@ def repackage_docm_to_docx(path, td):
                 zf.write(full, arc)
     out = os.path.join(td, "repack.docx")
     os.rename(rp, out)
+    # v2.6 Fix D: 중간 작업물 즉시 정리
+    try:
+        shutil.rmtree(ud, ignore_errors=True)
+    except Exception:
+        pass
     return out
 
 
 def _download_doc(entry, td_name, headers, max_retries=3):
-    """3GPP 서버에서 zip 다운로드. 일시적 실패 시 재시도."""
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -734,46 +1072,84 @@ def _download_doc(entry, td_name, headers, max_retries=3):
 
 
 # ==========================================
-# 4. Output 1 — extract_all_conclusions
+# v2.4: 디스크 청소 안전화
 # ==========================================
 def _cleanup_tmp_if_low_disk(force=False):
-    """디스크 잔여 용량이 전체의 30% 미만이면 /tmp 안의 이전 다운로드 잔류물을 정리."""
+    """
+    /tmp 잔해를 청소.
+    v2.5 수정:
+      - Python tempfile.TemporaryDirectory()가 만드는 tmpXXXXXXXX 패턴 추가
+      - 시간 기반 안전장치 강화 (force=True도 30분 미만은 보호)
+      - 명시적 3GPP 패턴(R1-XXX, TSGRX 등)도 유지
+    """
     import shutil
     try:
         tmp_dir = tempfile.gettempdir()
         disk = shutil.disk_usage(tmp_dir)
         free_pct = disk.free / disk.total * 100
 
+        # v2.5: 강제 정리여도 30분 미만은 보호 (현재 실행 중인 다른 분석 보호)
+        MAX_AGE_NORMAL = 3600    # 일반: 1시간
+        MAX_AGE_FORCE = 1800     # 강제: 30분 (다른 사용자 진행 중 작업 보호)
+
         if free_pct < 30 or force:
             reason = "강제 정리" if force else f"여유 {free_pct:.1f}%"
             append_log(f"🧹 /tmp 정리 시작 ({reason})...")
             cleaned = 0
+            skipped_recent = 0
+            now = time.time()
+
+            # v2.5: 실제 디렉터리 구조에 맞는 패턴
+            # tempfile.TemporaryDirectory()는 /tmp/tmpXXXXXXXX 형식의 디렉토리를 만듦.
+            # 안에 zip, docx, 추출된 doc 폴더 등이 들어감.
+            # 외부에서 직접 보이는 패턴은 tmpXXXX 디렉토리뿐.
+            STRICT_PATTERNS = [
+                # tempfile.TemporaryDirectory() 패턴 — /tmp/tmpAbCdEf12 등
+                re.compile(r'^tmp[a-zA-Z0-9_]{6,}$'),
+                # 3GPP 문서 ID 직접 노출 (혹시 잔해로 남았을 경우)
+                re.compile(r'^[RSC]\d?-\d{7}', re.I),
+                # TSG 회의 폴더 패턴
+                re.compile(r'^TSG[RSC]\d?_\d+', re.I),
+                # repackage 잔해
+                re.compile(r'^docm_unzip$', re.I),
+                re.compile(r'^repack(\.zip|\.docx)?$', re.I),
+                # TDoc xlsx
+                re.compile(r'^TDoc_List', re.I),
+            ]
+
+            max_age = MAX_AGE_FORCE if force else MAX_AGE_NORMAL
+
             for item in os.listdir(tmp_dir):
                 item_path = os.path.join(tmp_dir, item)
-                if any(kw in item.lower() for kw in [
-                    "tmp", "r1-", "r2-", "r3-", "r4-",
-                    "s1-", "s2-", "s3-", "s4-", "s5-", "s6-",
-                    "c1-", "c3-", "c4-",
-                    "3gpp", "docm_unzip", "repack",
-                    ".zip", ".docx", ".docm", ".doc",
-                    ".pptx", ".ppt", ".pdf",
-                    "tsgr", "tsgs", "tsgc", "ct4_",
-                ]):
-                    try:
-                        if os.path.isdir(item_path):
-                            shutil.rmtree(item_path, ignore_errors=True)
-                        else:
-                            os.remove(item_path)
-                        cleaned += 1
-                    except Exception:
-                        pass
-            if cleaned:
-                append_log(f"정리 완료: {cleaned}개 항목 삭제.")
+
+                # 명시적 패턴만 매칭
+                if not any(p.match(item) for p in STRICT_PATTERNS):
+                    continue
+
+                try:
+                    age = now - os.path.getmtime(item_path)
+                    if age < max_age:
+                        skipped_recent += 1
+                        continue
+
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path, ignore_errors=True)
+                    else:
+                        os.remove(item_path)
+                    cleaned += 1
+                except Exception:
+                    pass
+
+            if cleaned or skipped_recent:
+                age_label = "30분" if force else "1시간"
+                append_log(f"정리 완료: {cleaned}개 삭제, {skipped_recent}개 보호({age_label} 미만).")
                 try:
                     disk2 = shutil.disk_usage(tmp_dir)
                     append_log(f"여유 공간: {free_pct:.1f}% → {disk2.free / disk2.total * 100:.1f}%")
                 except Exception:
                     pass
+            else:
+                append_log("정리 대상 잔해 없음.")
         else:
             append_log(f"디스크 여유: {free_pct:.1f}% (정리 불필요)")
     except Exception as e:
@@ -782,14 +1158,12 @@ def _cleanup_tmp_if_low_disk(force=False):
 
 def extract_all_conclusions(entries, status_elem, progress_elem, log_func):
     _cleanup_tmp_if_low_disk()
-
     if CLOUD_FUNCTION_URL:
         return _extract_via_cloud(entries, status_elem, progress_elem, log_func)
     return _extract_local(entries, status_elem, progress_elem, log_func)
 
 
 def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
-    """Cloud Function으로 다운로드/파싱 위임, 결과로 원본과 동일한 docx 생성."""
     od = Document()
     od.add_heading("3GPP Conclusions", level=0)
     extracted_list = []
@@ -877,14 +1251,13 @@ def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
 
 
 def _extract_local(entries, status_elem, progress_elem, log_func):
-    """원본 extract_all_conclusions과 동일."""
     with tempfile.TemporaryDirectory() as temp_dir:
         log_func(f"임시 디렉터리 생성: {temp_dir}")
         od = Document()
         od.add_heading("3GPP Conclusions", level=0)
 
-        cps = CONCLUSION_PATTERNS
-        eps = END_PATTERNS
+        # v2.6 Fix J: CONCLUSION_PATTERNS/END_PATTERNS 변수 제거.
+        # 헤더 판정은 is_conclusion_header() / is_end_header() 함수 직접 호출.
         headers = {"User-Agent": "Mozilla/5.0"}
         download_results = []
         extracted_list = []
@@ -926,11 +1299,18 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                 ed = os.path.join(temp_dir, e["doc"])
                 os.makedirs(ed, exist_ok=True)
                 with zipfile.ZipFile(fp) as zf:
-                    zf.extractall(ed)
+                    # v2.6 Fix F: ZipSlip 방어
+                    _safe_extractall(zf, ed)
 
+                # v2.6 Fix G: macOS AppleDouble 아티팩트(._filename.docx 등) 제외.
+                # 이런 파일을 python-docx가 열려고 하면 BadZipFile로 실패함.
                 src_path = None
                 for ext in ("*.docx", "*.docm", "*.doc", "*.pptx", "*.ppt", "*.pdf"):
-                    src_path = next(Path(ed).rglob(ext), None)
+                    for candidate in Path(ed).rglob(ext):
+                        if candidate.name.startswith("._"):
+                            continue
+                        src_path = candidate
+                        break
                     if src_path: break
 
                 if not src_path:
@@ -1057,29 +1437,26 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         pdf_appended = True
                         log_func(f"{e['doc']} PDF 추출 완료")
                     except ImportError:
+                        # ★ v2.6 Fix E: 바이너리 폴백 제거 ★
+                        # 기존 코드는 PDF 바이너리를 ASCII로 강제 디코드해서 그 결과를
+                        # extracted_list에 넣었음. PDF는 FlateDecode 압축이라
+                        # 의미 없는 PostScript 조각이 LLM 입력으로 들어가
+                        # 할루시네이션을 유발. 이제는 명시적 placeholder만 남기고
+                        # full_content=""로 두어 Gemini 입력에서 자동 제외.
+                        _safe_add_paragraph(od, "[PDF — PyMuPDF 미설치, 텍스트 추출 불가]")
+                        extracted_list.append({
+                            "doc": e["doc"], "company": e["company"], "link": e["link"],
+                            "title": "(PDF — 라이브러리 없음)",
+                            "content": "PyMuPDF 라이브러리가 설치되지 않아 PDF 텍스트를 추출할 수 없습니다.",
+                            "full_content": ""
+                        })
+                        pdf_appended = True
+                        # 스킵 카운트 증가 → 추출 후 배너 표시용
                         try:
-                            with open(file_path_str, "rb") as bf:
-                                raw = bf.read()
-                            try:
-                                decoded = raw.decode('utf-8', errors='ignore')
-                                raw_text = re.sub(r'[\x00-\x1f\x7f]+', '\n', decoded)
-                                lines_filtered = [l for l in raw_text.split('\n') if len(l.strip()) >= 20]
-                                raw_text = "\n".join(lines_filtered)
-                            except:
-                                text_chunks = re.findall(rb'[\x20-\x7E]{20,}', raw)
-                                raw_text = "\n".join(c.decode('ascii', errors='ignore') for c in text_chunks)
-                            _safe_add_paragraph(od, "[PDF — 기본 텍스트 추출]")
-                            for line in raw_text.split('\n')[:30]:
-                                _safe_add_paragraph(od, line)
-                                doc_text_buffer.append(line)
-                            extracted_list.append({
-                                "doc": e["doc"], "company": e["company"], "link": e["link"],
-                                "title": "(PDF)", "content": raw_text[:3000],
-                                "full_content": raw_text[:30000]
-                            })
-                            pdf_appended = True
-                        except Exception as ex:
-                            _safe_add_paragraph(od, f"PDF 텍스트 추출 실패: {ex}")
+                            st.session_state.pdf_skip_count = st.session_state.get("pdf_skip_count", 0) + 1
+                        except Exception:
+                            pass
+                        log_func(f"{e['doc']} PDF skipped (no PyMuPDF)")
                     except Exception as ex:
                         _safe_add_paragraph(od, f"PDF 처리 오류: {ex}")
                         log_func(f"{e['doc']} PDF 오류: {ex}")
@@ -1209,23 +1586,23 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         od.add_page_break()
                     continue
 
+                # v2.6 Fix J: 어근 기반 헤더 매칭으로 conclusion 섹션 시작 찾기
                 start = None
-                for pat in cps:
-                    for j, p in enumerate(paras):
-                        if pat.match(p.text.strip()):
-                            start = j; break
-                    if start is not None: break
+                for j, p in enumerate(paras):
+                    if is_conclusion_header(p.text):
+                        start = j
+                        break
 
                 if start is None:
                     _safe_add_paragraph(od, "결론 섹션 없음")
                     log_func(f"{e['doc']} 결론없음")
                 else:
+                    # v2.6 Fix J: 어근 기반 헤더 매칭으로 end 섹션 찾기
                     end = len(paras)
-                    for ep in eps:
-                        for j, p in enumerate(paras[start+1:], start+1):
-                            if ep.match(p.text.strip()):
-                                end = j; break
-                        if end < len(paras): break
+                    for j, p in enumerate(paras[start+1:], start+1):
+                        if is_end_header(p.text):
+                            end = j
+                            break
                     for j in range(start+1, end):
                         try:
                             clone_paragraph(paras[j], od)
@@ -1284,7 +1661,7 @@ def _build_notebooklm_txt(extracted_list):
 
 
 # ==========================================
-# 5. Output 2 — TF-IDF parse_and_summarize
+# Output 2 — TF-IDF parse_and_summarize
 # ==========================================
 class TFIDFEmbedder:
     def __init__(self, max_features=3000, ngram_range=(1, 2)):
@@ -1305,7 +1682,6 @@ class TFIDFEmbedder:
 
 
 def parse_and_summarize(in_bio, status_elem, log_func):
-    """원본 parse_and_summarize와 동일."""
     d = Document(in_bio)
     props, pcs, cur = [], {}, None
 
@@ -1404,24 +1780,86 @@ def parse_and_summarize(in_bio, status_elem, log_func):
 
 
 # ==========================================
-# 6. Output 3 — Gemini AI 분석 (선택, 서버 키)
-#    ★ v2.3 수정: 모든 generate_content 호출 직전에 키 재설정 ★
+# v2.4: Gemini AI 분석 — 모델 선택 + 503 폴백 + Direct 임계값 상향
 # ==========================================
 def _build_doc_inventory(extracted_data):
-    """다운로드된 문서 목록을 명시적으로 나열."""
     lines = []
     for item in extracted_data:
         lines.append(f"  - {item['doc']} (회사: {item['company']})")
     return "\n".join(lines)
 
 
-def run_gemini_analysis(extracted_data, status_elem, api_key):
+def _call_with_retry_and_fallback(api_key, model_obj, prompt, generation_config,
+                                    status_elem, max_retries, start_time,
+                                    current_model_name, model_choice):
+    """
+    v2.4: 503 받으면 Flash로 폴백 후 재시도.
+    v2.5 수정: 폴백된 모델 객체도 반환 → 호출자가 다음 호출에 사용 가능.
+    Returns: (response, final_model_name, final_model_obj) or (None, None, None)
+    """
+    cur_model = model_obj
+    cur_name = current_model_name
+    fallback_attempted = False
+
+    for attempt in range(max_retries):
+        try:
+            res = _safe_gemini_call(api_key, cur_model, prompt, generation_config=generation_config)
+            return res, cur_name, cur_model
+        except Exception as e:
+            err_str = str(e)
+            is_429 = "429" in err_str
+            is_503 = "503" in err_str or "overloaded" in err_str.lower() or "unavailable" in err_str.lower()
+
+            # v2.4: 503이고 아직 Flash로 폴백 안 했으면 폴백
+            if is_503 and not fallback_attempted and model_choice == "pro_auto":
+                fallback_attempted = True
+                valid_models = _get_cached_models(api_key)
+                # v2.5: Pro 제외하고 Flash 모델만 잡도록 명시
+                flash_target = _pick_model_by_priority(
+                    valid_models, FLASH_PRIORITY_PATTERNS,
+                    extra_excludes=["pro"]
+                )
+                if flash_target and flash_target != cur_name:
+                    if status_elem:
+                        try:
+                            status_elem.text(f"⚠️ Pro 서버 과부하 — Flash로 영구 폴백: {flash_target.split('/')[-1]}")
+                        except Exception:
+                            pass
+                    append_log(f"503 폴백: {cur_name} → {flash_target}")
+                    cur_model = genai.GenerativeModel(flash_target)
+                    cur_name = flash_target.split('/')[-1]
+                    time.sleep(3)
+                    continue  # 즉시 재시도 (대기 없음)
+
+            if is_429 or is_503:
+                wait = [30, 60, 120, 180, 240][min(attempt, 4)]
+                elapsed = int(time.time() - start_time)
+                for cd in range(wait, 0, -1):
+                    elapsed = int(time.time() - start_time)
+                    if status_elem:
+                        try:
+                            status_elem.text(
+                                f"⚠️ API 한도/과부하 대기 {cd}초 (시도 {attempt+1}/{max_retries}, "
+                                f"총 {elapsed//60}분 {elapsed%60}초 경과)"
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(1)
+            else:
+                raise
+
+    return None, None, None
+
+
+def run_gemini_analysis(extracted_data, status_elem, api_key,
+                        model_choice="flash_auto", manual_model_name="",
+                        call_interval=8):
+    """v2.4: 모델 선택, 호출 간격, 503 폴백 추가."""
     if not extracted_data:
         st.warning("⚠️ 분석할 문서가 없습니다.")
         return False
 
-    # ★ 초기 configure — 락 안에서 안전하게
-    with _genai_lock:
+    with _GLOBAL_GEMINI_LOCK:
         genai.configure(api_key=api_key)
     _gemini_start_time = time.time()
 
@@ -1449,14 +1887,11 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 1. 아래 [허용된 문서 목록]에 있는 문서 번호만 인용할 수 있습니다.
-   이 목록에 없는 문서 번호를 절대 만들어내거나 인용하지 마세요.
 2. 아래 [허용된 회사 목록]에 있는 회사명만 사용할 수 있습니다.
-   이 목록에 없는 회사를 절대 만들어내지 마세요.
 3. 원문에 명시적으로 적혀 있는 내용만 분석하세요.
-   원문에 없는 내용을 추론하거나 지어내지 마세요.
 4. 어떤 회사가 어떤 제안을 지지하는지는, 해당 회사의 기고문에
    해당 제안이 실제로 기술되어 있을 때만 인정됩니다.
-5. 확실하지 않으면 포함하지 마세요. 누락이 환각보다 낫습니다.
+5. 확실하지 않으면 포함하지 마세요.
 
 [허용된 문서 목록]
 {doc_inventory}
@@ -1465,28 +1900,22 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 {', '.join(sorted(valid_companies))}
 
 주의: 다음 회사들은 같은 그룹이므로 하나의 회사로 취급하세요:
-- ZTE = Sanechips (같은 그룹)
-- Huawei = HiSilicon (같은 그룹)
-- Nokia = Nokia Shanghai Bell (같은 그룹)
+- ZTE = Sanechips
+- Huawei = HiSilicon
+- Nokia = Nokia Shanghai Bell
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[그룹핑 규칙 — 정밀 그룹핑]
+[그룹핑 규칙]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. 두 제안을 같은 그룹으로 묶으려면, 다음 조건을 모두 만족해야 합니다:
-   a) 같은 기술적 메커니즘을 다루고 있어야 합니다.
-   b) 제안하는 구체적 동작/방향이 동일하거나 매우 유사해야 합니다.
-   c) 같은 주제를 다루더라도 제안 방향이 다르면 별도 그룹입니다.
+1. 두 제안을 같은 그룹으로 묶으려면:
+   a) 같은 기술적 메커니즘을 다루고 있어야 함
+   b) 제안하는 구체적 동작이 동일하거나 매우 유사해야 함
+   c) 같은 주제라도 제안 방향이 다르면 별도 그룹
 
-2. 뭉뚱그리지 마세요:
-   - "에너지 효율 관련 제안"처럼 광범위한 그룹은 금지합니다.
-   - "Cell DTX/DRX 패턴을 UE에 알려야 한다"처럼 구체적 동작 수준으로 묶으세요.
-   - 하나의 기고문에 여러 개의 서로 다른 제안이 있으면,
-     각 제안을 별도로 분류하세요.
-
-3. 1개 회사만 단독 주장한 제안은 결과에서 제외하세요.
-
-4. CR(Change Request) 문서의 경우, "Summary of change" 내용을 해당 회사의 제안으로 취급하세요.
+2. 뭉뚱그리지 마세요. "에너지 효율 관련" 같은 광범위 그룹 금지.
+3. 1개 회사만 단독 주장한 제안은 제외.
+4. CR 문서의 "Summary of change"도 제안으로 취급.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [출력 양식]
@@ -1494,12 +1923,12 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 
 ### [순위]. [제안의 구체적 동작을 요약한 제목]
 * **지지 회사 (총 N개사):** 회사명1, 회사명2, ...
-* **상세 내용:** 이 제안이 구체적으로 무엇을 요구하는지 2-3문장으로 기술.
+* **상세 내용:** 이 제안이 구체적으로 무엇을 요구하는지 2-3문장.
 * **근거 문서:**
-  - [문서번호] (회사명): 해당 문서에서 이 제안이 나오는 부분의 핵심 문구 인용
-  - [문서번호] (회사명): 해당 문서에서 이 제안이 나오는 부분의 핵심 문구 인용
+  - [문서번호] (회사명): 핵심 문구 인용
+  - [문서번호] (회사명): 핵심 문구 인용
 
-순위는 지지 회사 수가 많은 순서대로 내림차순으로 부여하세요.
+순위는 지지 회사 수 내림차순.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [기고문 원문 데이터]
@@ -1511,80 +1940,76 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
     MAP_PROMPT_TEMPLATE = """당신은 3GPP 기고문 분석 전문가입니다.
 
 [절대 규칙]
-1. 아래 제공된 문서에 있는 내용만 추출하세요. 없는 내용을 지어내지 마세요.
+1. 아래 문서에 있는 내용만 추출. 없는 내용 지어내지 마세요.
 2. 허용된 문서 번호: {doc_list}
-3. 각 제안을 추출할 때, 반드시 해당 제안이 적힌 문서 번호와 회사명을 함께 기록하세요.
-4. 하나의 기고문에 여러 제안이 있으면 각각 별도로 추출하세요.
-5. 구체적 동작 수준으로 추출하세요.
+3. 각 제안마다 문서 번호와 회사명 함께 기록.
+4. 하나의 기고문에 여러 제안이 있으면 각각 별도로.
 
 [출력 양식]
-- 제안: [원문에 가깝게 제안 내용 기술]
+- 제안: [원문에 가깝게 기술]
 - 문서: [문서번호]
 - 회사: [회사명]
-- 원문 근거: [해당 제안이 나오는 원문 문구를 최대한 그대로 인용]
-
-빠지는 제안이 없도록 모든 Proposal, Observation, Recommendation을 추출하세요.
+- 원문 근거: [원문 인용]
 
 [기고문 원문]
 {batch_text}"""
 
     REDUCE_PROMPT_TEMPLATE = """당신은 3GPP 기고문 분석 전문가입니다.
 
-아래에 1차 추출된 제안 목록이 있습니다. 이를 최종 보고서로 병합하세요.
+[절대 규칙]
+1. 허용된 문서 번호: {doc_list}
+2. 허용된 회사: {company_list}
+3. 1차 추출 결과에 실제로 있는 내용만 사용.
 
-[절대 규칙 — 할루시네이션 금지]
-1. 허용된 문서 번호: {doc_list}.
-2. 허용된 회사: {company_list}.
-3. 1차 추출 결과에 실제로 있는 내용만 사용하세요.
-
-[그룹핑 규칙 — 정밀 그룹핑]
-1. 구체적 동작이 동일한 제안만 같은 그룹으로 묶으세요.
-2. 같은 주제라도 제안 방향이 다르면 별도 그룹입니다.
-3. 광범위한 그룹은 금지. 구체화하세요.
-4. 2개 이상의 회사가 지지하는 제안만 포함하세요.
-5. CR 문서의 "Summary of change"도 제안으로 취급하여 그룹핑에 포함하세요.
+[그룹핑 규칙]
+1. 구체적 동작이 동일한 제안만 같은 그룹.
+2. 같은 주제라도 방향 다르면 별도.
+3. 광범위 그룹 금지.
+4. 2개 이상 회사 지지한 제안만 포함.
+5. CR Summary of change도 포함.
 
 [출력 양식]
-### [순위]. [제안의 구체적 동작 요약 제목]
+### [순위]. [제안의 구체적 동작 요약]
 * **지지 회사 (총 N개사):** 회사1, 회사2, ...
-* **상세 내용:** 구체적 제안 내용 2-3문장
+* **상세 내용:** 구체적 제안 2-3문장
 * **근거 문서:**
-  - [문서번호] (회사명): 원문 핵심 문구 인용
+  - [문서번호] (회사명): 핵심 문구
 
-지지 회사 수 내림차순으로 정렬.
+내림차순 정렬.
 
 [1차 추출 결과]
 {intermediate_text}"""
 
-    status_elem.text("🧠 Gemini AI 분석 중... 모델을 선택하고 있습니다...")
+    status_elem.text("🧠 모델을 선택하고 있습니다...")
     try:
-        valid_models = _get_cached_models(api_key)
-
-        if not valid_models:
+        # v2.4: 모델 선택 (매번 재선택, 캐시 안 함)
+        target, display_or_err = _resolve_model_for_choice(api_key, model_choice, manual_model_name)
+        if not target:
             st.error(
-                "❌ **사용 가능한 Gemini 모델을 찾지 못했습니다.**\n\n"
-                "API 키가 잘못되었거나 네트워크가 불안정할 수 있습니다.\n\n"
-                "**해결 방법:** 키를 다시 확인하거나 잠시 후 다시 시도하세요."
+                f"❌ **모델 선택 실패:** {display_or_err}\n\n"
+                f"위에서 **'⚙️ 수동 선택'** 모드로 전환하여 사용 가능한 모델을 직접 골라주세요."
             )
             return False
 
-        target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
-                       next((m for m in valid_models if 'pro' in m.lower() and 'vision' not in m.lower()), valid_models[-1]))
-
-        model_display = target.split('/')[-1]
+        model_display = display_or_err
         model = genai.GenerativeModel(target)
         strict_config = {"temperature": 0.0}
 
-        status_elem.text(f"🧠 모델: {model_display} — 분석을 시작합니다...")
+        status_elem.text(f"🧠 모델: **{model_display}** — 분석을 시작합니다...")
+        append_log(f"선택된 모델: {target}")
 
         total_docs = len(extracted_data)
         response = None
+        final_model = model_display
         doc_list_str = ", ".join(sorted(valid_doc_ids))
         company_list_str = ", ".join(sorted(valid_companies))
 
-        if total_docs > 20:
+        # v2.4: Direct 임계값 20 → 50으로 상향
+        DIRECT_THRESHOLD = 50
+
+        if total_docs > DIRECT_THRESHOLD:
             # Map-Reduce
-            batch_size = 20
+            batch_size = DIRECT_THRESHOLD
             total_batches = (total_docs + batch_size - 1) // batch_size
             intermediate = []
             for i in range(total_batches):
@@ -1599,41 +2024,30 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                 batch_docs = ", ".join([it['doc'] for it in batch])
                 mp = MAP_PROMPT_TEMPLATE.format(doc_list=batch_docs, batch_text=bt)
 
-                batch_success = False
-                for attempt in range(5):
-                    try:
-                        # ★ 핵심 수정: 키 재설정 + generate_content를 원자화
-                        res = _safe_gemini_call(api_key, model, mp, generation_config=strict_config)
-                        try:
-                            if res and res.text and len(res.text.strip()) > 10:
-                                intermediate.append(res.text)
-                                batch_success = True
-                        except (ValueError, AttributeError):
-                            append_log(f"배치 {i+1}: 응답 텍스트 접근 실패 (safety filter?)")
-                        break
-                    except Exception as e:
-                        if "429" in str(e) or "503" in str(e):
-                            wait = [30, 60, 120, 180, 240][min(attempt, 4)]
-                            elapsed = int(time.time() - _gemini_start_time)
-                            if elapsed > 600:
-                                status_elem.text(
-                                    f"⚠️ {elapsed//60}분 경과 — API 한도/과부하 상황입니다. "
-                                    f"개인 API 키로 시도하거나 새 키 발급 후 재시도해 보세요."
-                                )
-                            for cd in range(wait,0,-1):
-                                elapsed = int(time.time() - _gemini_start_time)
-                                status_elem.text(
-                                    f"⚠️ API 한도/과부하 대기 {cd}초 (시도 {attempt+1}/5, "
-                                    f"총 {elapsed//60}분 {elapsed%60}초 경과)"
-                                )
-                                time.sleep(1)
-                        else: raise
+                res, ret_name, ret_model = _call_with_retry_and_fallback(
+                    api_key, model, mp, strict_config,
+                    status_elem, 5, _gemini_start_time,
+                    final_model, model_choice
+                )
+                # v2.5: 폴백된 모델 객체로 영구 교체 (다음 배치도 같은 모델 사용)
+                if ret_name:
+                    final_model = ret_name
+                if ret_model is not None and ret_model is not model:
+                    model = ret_model
+                    append_log(f"모델 영구 교체됨: → {final_model}")
 
-                if not batch_success:
+                if res is not None:
+                    try:
+                        if res.text and len(res.text.strip()) > 10:
+                            intermediate.append(res.text)
+                    except (ValueError, AttributeError):
+                        append_log(f"배치 {i+1}: 응답 텍스트 접근 실패 (safety filter?)")
+                else:
                     append_log(f"배치 {i+1} 실패 (5회 재시도 소진)")
 
+                # v2.4: 호출 간격 사용자 설정
                 if i < total_batches-1:
-                    for cd in range(5,0,-1):
+                    for cd in range(call_interval, 0, -1):
                         status_elem.text(f"⏳ 배치 간 대기 {cd}초 ({i+1}/{total_batches} 완료)")
                         time.sleep(1)
 
@@ -1641,74 +2055,54 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
                 elapsed = int(time.time() - _gemini_start_time)
                 st.error(
                     f"❌ **{elapsed//60}분 동안 시도했으나 결과를 받지 못했습니다.**\n\n"
-                    f"가능한 원인:\n"
-                    f"1. 사용 중인 API 키의 일일/분당 한도가 소진됨\n"
-                    f"2. 입력한 키가 잘못되었거나 만료됨 (앞뒤 공백 확인)\n"
-                    f"3. 무료 티어 한도 초과 (Pro 모델은 일 100회, Flash는 일 250회)\n\n"
                     f"**해결 방법:**\n"
-                    f"- Google AI Studio에서 새 키 발급 후 재시도\n"
-                    f"- 24시간 후 한도 리셋 대기\n"
+                    f"- 다른 모델 선택 (Flash가 가장 한도 여유 있음)\n"
+                    f"- 호출 간격을 더 길게 (사이드바 슬라이더)\n"
+                    f"- 새 키 발급 후 재시도\n"
                     f"- NotebookLM(아래 섹션)을 대안으로 사용"
                 )
                 return False
 
-            status_elem.text("🧠 최종 병합 분석 중... (가장 오래 걸리는 단계입니다)")
+            status_elem.text("🧠 최종 병합 분석 중...")
             fi = "\n\n=== 배치 구분 ===\n\n".join(intermediate)
             rp = REDUCE_PROMPT_TEMPLATE.format(
                 doc_list=doc_list_str,
                 company_list=company_list_str,
                 intermediate_text=fi,
             )
-            for attempt in range(5):
-                try:
-                    # ★ 핵심 수정: 키 재설정 + generate_content를 원자화
-                    response = _safe_gemini_call(api_key, model, rp, generation_config=strict_config)
-                    break
-                except Exception as e:
-                    if "429" in str(e) or "503" in str(e):
-                        wait = [30, 60, 120, 180, 240][min(attempt, 4)]
-                        for cd in range(wait,0,-1):
-                            elapsed = int(time.time() - _gemini_start_time)
-                            status_elem.text(f"⚠️ 최종 병합 대기 {cd}초 (시도 {attempt+1}/5, 총 {elapsed//60}분 {elapsed%60}초 경과)"); time.sleep(1)
-                    else: raise
+            response, ret_name, ret_model = _call_with_retry_and_fallback(
+                api_key, model, rp, strict_config,
+                status_elem, 5, _gemini_start_time,
+                final_model, model_choice
+            )
+            if ret_name:
+                final_model = ret_name
+            if ret_model is not None and ret_model is not model:
+                model = ret_model
         else:
             # Direct analysis
-            for attempt in range(5):
-                try:
-                    # ★ 핵심 수정: 키 재설정 + generate_content를 원자화
-                    response = _safe_gemini_call(api_key, model, MAIN_PROMPT, generation_config=strict_config)
-                    break
-                except Exception as e:
-                    if "429" in str(e) or "503" in str(e):
-                        wait = [30, 60, 120, 180, 240][min(attempt, 4)]
-                        elapsed = int(time.time() - _gemini_start_time)
-                        if elapsed > 600:
-                            status_elem.text(
-                                f"⚠️ {elapsed//60}분 경과 — 개인 키로 시도하거나 새 키 발급을 고려하세요."
-                            )
-                            time.sleep(3)
-                        for cd in range(wait,0,-1):
-                            elapsed = int(time.time() - _gemini_start_time)
-                            status_elem.text(f"⚠️ API 대기 {cd}초 (시도 {attempt+1}/5, 총 {elapsed//60}분 {elapsed%60}초 경과)"); time.sleep(1)
-                    else: raise
+            response, ret_name, ret_model = _call_with_retry_and_fallback(
+                api_key, model, MAIN_PROMPT, strict_config,
+                status_elem, 5, _gemini_start_time,
+                final_model, model_choice
+            )
+            if ret_name:
+                final_model = ret_name
+            if ret_model is not None and ret_model is not model:
+                model = ret_model
 
         status_elem.text("🔍 응답 확인 중...")
 
         if response is None:
             st.error(
                 "❌ **API 응답을 받지 못했습니다.**\n\n"
-                "사용 중인 API 키의 한도가 소진되었거나 일시적 과부하 상황입니다.\n\n"
-                "**해결 방법:** Google AI Studio에서 새 키를 발급(`Create API key in new project`)받아 "
-                "재시도하거나, NotebookLM(아래 섹션)을 대안으로 사용해 주세요."
+                "한도 소진 또는 일시적 과부하 상황입니다.\n\n"
+                "**해결:** 모델을 Flash로 변경하거나, 새 키 발급 후 재시도."
             )
             return False
 
         if not hasattr(response, 'text'):
-            st.error(
-                "❌ **API가 빈 응답을 반환했습니다.**\n\n"
-                "한도 소진 또는 입력 문서 수가 너무 많아 처리에 실패했습니다.\n\n"
-                "**해결 방법:** 새 키로 재시도하거나, 분석할 문서 수를 줄여서 다시 시도해 주세요."
-            )
+            st.error("❌ **API가 빈 응답을 반환했습니다.**")
             return False
 
         try:
@@ -1716,18 +2110,13 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
         except (ValueError, AttributeError) as e:
             st.error(
                 "❌ **AI 응답이 안전 필터에 의해 차단되었습니다.**\n\n"
-                "기고문 내용이 AI 안전 정책에 의해 필터링되었을 수 있습니다.\n\n"
-                "**해결:** 다시 시도하거나 NotebookLM을 사용해 주세요."
+                "**해결:** 다시 시도하거나 NotebookLM 사용."
             )
             append_log(f"Gemini safety filter: {e}")
             return False
 
         if not result_text or len(result_text.strip()) < 50:
-            st.error(
-                "❌ **AI 응답이 너무 짧습니다.**\n\n"
-                "API 부하로 인해 불완전한 응답이 왔습니다.\n\n"
-                "**해결 방법:** 새 키로 재시도하거나 NotebookLM을 사용해 주세요."
-            )
+            st.error("❌ **AI 응답이 너무 짧습니다.**")
             return False
 
         status_elem.text("✅ AI 분석 완료! 결과 문서를 생성하고 있습니다...")
@@ -1738,9 +2127,9 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
             result_text += f"\n\n---\n⚠️ **검증 경고:** 다음 문서 번호는 다운로드된 파일 목록에 없습니다 (할루시네이션 가능성): {', '.join(sorted(hallucinated))}"
 
         doc = Document()
-        doc.add_heading(f"AI 정밀 분석 요약 ({model_display})", 0)
+        doc.add_heading(f"AI 정밀 분석 요약 ({final_model})", 0)
         _safe_add_paragraph(doc, f"분석 대상: {total_docs}개 문서")
-        _safe_add_paragraph(doc, f"분석 모델: {model_display} (temperature=0.0)")
+        _safe_add_paragraph(doc, f"분석 모델: {final_model} (temperature=0.0)")
         _safe_add_paragraph(doc, "")
         for line in result_text.split('\n'):
             if re.match(r'^(#+)?\s*\d+\.|^###', line.strip()):
@@ -1760,7 +2149,7 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
         doc.save(bio)
         st.session_state.ai_summary_bytes = bio.getvalue()
         st.session_state.ai_summary_text = result_text
-        st.session_state.ai_model_name = model_display
+        st.session_state.ai_model_name = final_model
         st.session_state.ai_summary_generated = True
         status_elem.text("✅ 완료! 아래에서 결과를 확인하세요.")
         st.rerun()
@@ -1768,7 +2157,6 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
 
     except Exception as e:
         err = str(e)
-        # ★ 보안: 키 마스킹
         if GEMINI_API_KEY and GEMINI_API_KEY in err:
             err = err.replace(GEMINI_API_KEY, "***HIDDEN***")
         if api_key and api_key in err:
@@ -1776,31 +2164,21 @@ def run_gemini_analysis(extracted_data, status_elem, api_key):
         if "429" in err or "Quota" in err or "exhausted" in err.lower():
             st.error(
                 "❌ **API 한도가 초과되었습니다.**\n\n"
-                "사용 중인 키의 일일/분당 한도가 소진되었거나, "
-                "동시 사용자가 너무 많은 상황입니다.\n\n"
-                "**해결 방법:**\n"
-                "- Google AI Studio에서 새 키 발급 (`Create API key in new project`)\n"
-                "- 24시간 후 한도 리셋 대기\n"
-                "- NotebookLM(아래 섹션)을 대안으로 사용"
+                "**해결:** Flash 모델 선택 또는 새 키 발급."
             )
         else:
-            st.error(
-                f"❌ **API 오류가 발생했습니다.**\n\n"
-                f"잠시 후 다시 시도하거나, 새 API 키를 사용해 보세요."
-            )
+            st.error(f"❌ **API 오류가 발생했습니다.**")
             append_log(f"Gemini error (sanitized): {err[:200]}")
     return False
 
 
 # ==========================================
-# 6-B. 심층 분석 — 근거 및 반박 논리 분석
+# 심층 분석
 # ==========================================
 
 def _parse_ai_summary_into_proposals(ai_summary_text):
-    """Gemini 결과 마크다운을 제안(###) 단위로 파싱."""
     if not ai_summary_text:
         return []
-
     parts = re.split(r'\n(?=###\s)', ai_summary_text)
     proposals = []
     for part in parts:
@@ -1821,7 +2199,6 @@ def _parse_ai_summary_into_proposals(ai_summary_text):
 
 
 def _select_docs_for_deep_analysis(doc_ids, extracted_data, max_docs=5):
-    """심층 분석용 문서 선정 — 메이저 벤더 우선."""
     matching = [item for item in extracted_data if item.get("doc") in doc_ids]
 
     def tier_of(company):
@@ -1854,23 +2231,19 @@ def _select_docs_for_deep_analysis(doc_ids, extracted_data, max_docs=5):
     return selected
 
 
-def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key):
-    """선정된 문서들의 원문을 바탕으로 근거 및 반박 논리 분석.
-    ★ v2.3 수정: generate_content 호출 직전에 키 재설정 ★
-    """
+def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key,
+                       model_choice="flash_auto", manual_model_name=""):
     if not selected_docs:
         return False, "분석 가능한 문서가 없습니다."
 
     try:
-        # ★ 초기 configure — 락 안에서 안전하게
-        with _genai_lock:
+        with _GLOBAL_GEMINI_LOCK:
             genai.configure(api_key=api_key)
 
-        valid_models = _get_cached_models(api_key)
-        if not valid_models:
-            return False, "사용 가능한 Gemini 모델을 찾지 못했습니다. API 키 또는 네트워크를 확인하세요."
-        target = next((m for m in valid_models if 'flash' in m.lower() and 'vision' not in m.lower()),
-                     valid_models[-1])
+        # v2.4: 사용자 선택 모델 사용 (Flash 강제 아님)
+        target, display_or_err = _resolve_model_for_choice(api_key, model_choice, manual_model_name)
+        if not target:
+            return False, f"모델 선택 실패: {display_or_err}"
 
         model = genai.GenerativeModel(
             model_name=target,
@@ -1929,45 +2302,43 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key):
 {combined_content}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[출력 규칙 — 매우 중요]
+[출력 규칙]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. [근거] 섹션: 오직 위에 제공된 원문 내용만 사용. 외부 지식 금지.
-2. [반박] 섹션: **반드시 작성해야 합니다** (절대 생략 불가). 반박은 표준화 전문가 관점에서의 **합리적 비판**이며, 외부 지식 금지 규칙의 예외입니다. 이동통신 표준 및 네트워크 엔지니어링 관점에서 자유롭게 기술적 우려사항을 제기하세요. 단, 반드시 "⚠️ 추론" 태그로 시작하세요.
-3. [전략적 함의] 섹션: **반드시 작성해야 합니다**. 이 제안이 채택/거절될 경우의 영향을 분석.
-4. 모든 3개 섹션(근거, 반박, 전략)을 빠짐없이 작성하세요.
+1. [근거] 섹션: 오직 위에 제공된 원문 내용만 사용.
+2. [반박] 섹션: **반드시 작성** (절대 생략 불가). "⚠️ 추론" 태그 필수.
+3. [전략적 함의] 섹션: **반드시 작성**.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[출력 양식 — 반드시 아래 3개 섹션 모두 포함]
+[출력 양식]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ### 🧠 주장의 근거 및 논리
 
 **핵심 논거:**
-1. [논거 1 — 기술적 이유/필요성, 원문 기반]
+1. [논거 1 — 원문 기반]
 2. [논거 2]
 3. [논거 3]
 
 **회사별 논리 전개:**
-- **[회사A] ([문서번호]):** 이 회사의 논리 전개 요약 (2-3문장)
+- **[회사A] ([문서번호]):** 논리 전개 요약
 - **[회사B] ([문서번호]):** ...
 
-### ⚡ 가능한 반박 논리 (필수 섹션 — 반드시 작성)
+### ⚡ 가능한 반박 논리 (필수 섹션)
 
 **(a) 원문에 나타난 반대 의견:**
-- [다른 회사가 원문에서 반대했으면 인용. 없으면 "원문에는 명시적 반대 의견이 없음" 기재 후 (b)로 진행]
+- [있으면 인용. 없으면 "원문에는 명시적 반대 없음" 기재 후 (b)로]
 
 **(b) ⚠️ 추론 — 기술적/구현적 관점의 반박:**
-1. **[반박 관점 1 — 예: 구현 복잡도]**: 예상되는 기술적 우려사항 상세 설명
-2. **[반박 관점 2 — 예: 오버헤드 증가]**: ...
-3. **[반박 관점 3 — 예: 호환성/Backward compatibility]**: ...
+1. **[관점 1 — 예: 구현 복잡도]**: 우려사항 상세
+2. **[관점 2 — 예: 오버헤드]**: ...
+3. **[관점 3 — 예: 호환성]**: ...
 
-### 🎯 전략적 함의 (필수 섹션 — 반드시 작성)
-- **채택 시 영향:** [어떤 회사군에 유리한지, 표준 방향성]
-- **거절 시 영향:** [대체 방안, 지연 영향]
-- **핵심 관전 포인트:** [주의 깊게 볼 논점 1-2개]
+### 🎯 전략적 함의 (필수 섹션)
+- **채택 시 영향:** [어떤 회사군에 유리한지]
+- **거절 시 영향:** [대체 방안]
+- **핵심 관전 포인트:** [주의 깊게 볼 논점]
 """
 
-        # ★ 핵심 수정: 키 재설정 + generate_content를 원자화
         response = _safe_gemini_call(api_key, model, prompt)
         if not response or not hasattr(response, 'text'):
             return False, "API 응답을 받지 못했습니다."
@@ -1989,106 +2360,110 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key):
         if api_key and api_key in err:
             err = err.replace(api_key, "***HIDDEN***")
         if "429" in err or "Quota" in err or "exhausted" in err.lower():
-            return False, "API 한도 초과. 새 키 발급 후 재시도하거나 잠시 후 다시 시도하세요."
+            return False, "API 한도 초과. Flash 모델 선택 또는 새 키 발급 후 재시도."
         return False, f"오류: {err[:200]}"
 
 
 # ==========================================
-# 7. Streamlit UI
+# Streamlit UI
 # ==========================================
 st.sidebar.title("📡 3GPP Analyzer v2")
 st.sidebar.caption("기본 분석 + Gemini AI 강화")
 st.sidebar.markdown("---")
+
+# v2.4: 사이드바에 호출 간격 슬라이더
+# v2.5 수정: key 파라미터로 session_state 자동 관리. 강제 할당 패턴 제거.
+with st.sidebar.expander("⚙️ Gemini API 고급 설정", expanded=False):
+    st.slider(
+        "배치 사이 대기 시간 (초)",
+        min_value=5, max_value=30,
+        key="ai_call_interval",  # session_state["ai_call_interval"]에 자동 저장
+        help="짧게 = 빠르지만 한도 초과 위험. 길게 = 안전하지만 느림. Flash는 8초, Pro는 15초 권장."
+    )
+    st.caption(f"현재: {st.session_state.ai_call_interval}초")
+
 page = st.sidebar.radio("메뉴", ["🚀 통합 분석기", "⚙️ 설정", "ℹ️ 가이드"])
 
-# ─── Settings ───
 if page == "⚙️ 설정":
     st.title("⚙️ 서버 설정")
-
     st.subheader("🔒 보안 안내")
     st.info(
         "API 키와 Cloud Function URL은 서버 환경변수 또는 Streamlit Secrets에 저장되며, "
-        "사용자 브라우저에 노출되지 않습니다. 에러 발생 시에도 키 값이 화면에 표시되지 않습니다."
+        "사용자 브라우저에 노출되지 않습니다."
     )
-
     st.subheader("Gemini API Key")
     st.info(f"상태: {'✅ 설정됨 (서버에 안전하게 저장)' if GEMINI_API_KEY else '❌ 미설정'}")
     if not GEMINI_API_KEY:
         st.code('# .streamlit/secrets.toml\nGEMINI_API_KEY = "AIzaSy..."', language="toml")
-
     st.subheader("Cloud Function URL")
     if CLOUD_FUNCTION_URL:
         masked_url = CLOUD_FUNCTION_URL[:40] + "..." if len(CLOUD_FUNCTION_URL) > 40 else CLOUD_FUNCTION_URL
         st.info(f"상태: ✅ 설정됨 ({masked_url})")
     else:
-        st.info("상태: ⚠️ 미설정 (서버에서 직접 다운로드)")
+        st.info("상태: ⚠️ 미설정")
 
 elif page == "ℹ️ 가이드":
     st.title("ℹ️ 사용 가이드")
-
     st.header("🔰 기본 사용법")
     st.markdown("""
-**1단계:** 🔍 회의 번호로 자동 조회 → Working Group과 회의 번호 입력 → Agenda 불러오기
-
+**1단계:** 🔍 회의 번호로 자동 조회 → Working Group과 회의 번호 입력
 **2단계:** 📋 Agenda 선택 → 🚀 기본 분석 실행
-- **Output 1:** 각 기고문의 결론(Conclusion) 부분을 서식 그대로 취합한 문서
-- **Output 2:** TF-IDF 단어 빈도 분석으로 유사한 Proposal을 자동 그룹핑한 요약
-
 **3단계:** ✨ Gemini AI 정밀 분석 (선택)
-- AI가 의미 기반으로 제안을 그룹핑하고, 지지 회사별로 정렬
-- 각 제안에 대해 원문 근거 문서와 인용 제공
     """)
 
     st.markdown("---")
     st.header("🔑 Gemini API 키 발급 가이드")
-
-    st.subheader("🟢 무료 API 키 발급 (추천, 1분 소요)")
     st.markdown("""
-**누구나 무료**로 발급받을 수 있으며, **카드 등록이 필요 없습니다.**
+**1단계:** [Google AI Studio - API 키 발급 페이지](https://aistudio.google.com/app/apikey)
+**2단계:** **'Create API key'** → **'Create API key in new project'** ⚠️ 반드시 in new project 선택!
+**3단계:** `AIzaSy...`로 시작하는 키를 복사하여 분석기에 붙여넣기
 
-**1단계:** 아래 링크를 클릭하여 Google AI Studio에 접속합니다 (구글 로그인 필요):
-
-👉 **[Google AI Studio - API 키 발급 페이지](https://aistudio.google.com/app/apikey)**
-
-**2단계:** 화면에서 파란색 **`Create API key`** 버튼을 클릭합니다.
-
-**3단계:** 팝업이 뜨면 **`Create API key in new project`** 를 클릭합니다.
-
-> ⚠️ **중요:** 반드시 **"in new project"**를 선택하세요!
-
-**4단계:** `AIzaSy...` 로 시작하는 긴 문자열이 생성됩니다.
-
-**5단계:** 이 문자열을 **복사(Ctrl+C)**하여 분석기의 API 키 입력창에 **붙여넣기(Ctrl+V)**하세요.
+✅ **완전 무료**, 카드 등록 불필요
     """)
 
     st.markdown("---")
-    st.header("📊 분석 결과 설명")
+    st.header("📊 모델 선택 가이드 (v2.6)")
     st.markdown("""
-**Output 1 (Conclusions 취합):** 각 기고문에서 Conclusion/Summary 섹션만 추출, 원본 서식 보존
-**Output 2 (TF-IDF 요약):** 단어 빈도 기반 자동 클러스터링, 지지 회사 수 내림차순 정렬
-**Output 3 (Gemini AI 정밀 분석):** AI가 의미 기반으로 제안 그룹핑, 원문 인용 제공
+**🟢 Flash 자동 (권장):**
+- 분당 10회, 일 250회까지 무료
+- 빠르고 안정적
+- 대부분의 분석에 충분
+
+**🟡 Pro 자동:**
+- 분당 5회, 일 100회 (한도 빠르게 소진)
+- 더 똑똑한 추론
+- 503 ServiceUnavailable 자주 발생 → 자동으로 Flash 폴백
+
+**⚙️ 수동 선택:**
+- 가용 모델 목록에서 직접 선택
+- 특정 버전 강제 사용 가능
     """)
 
-    st.markdown("---")
-    st.header("🔒 개인정보 및 보안")
-    st.markdown("""
-- **API 키 보호:** 입력한 API 키는 화면에 `****` 형태로 가려지며, 서버에 저장되지 않습니다.
-- **에러 메시지 보안:** 오류 발생 시에도 API 키가 화면에 표시되지 않도록 자동 마스킹됩니다.
-- **문서 데이터:** 다운로드된 기고문은 분석 완료 즉시 서버에서 자동 삭제됩니다.
-- **세션 종료:** 브라우저를 닫으면 모든 데이터가 즉시 소멸됩니다.
-    """)
-
-# ─── Main ───
 elif page == "🚀 통합 분석기":
     st.title("🚀 3GPP 기고문 통합 분석기")
     st.caption("Output 1·2는 기본 | Output 3 Gemini는 선택")
 
-    with st.expander("🆕 v2.3 업데이트 안내", expanded=True):
+    with st.expander("🆕 v2.6 업데이트 안내", expanded=True):
         st.markdown("""
-- **🔧 개인 API 키 즉시 429 문제 수정** — 동시 사용자 환경에서 발생하던 키 오염 버그를 락 메커니즘으로 차단
-- **🔍 근거 및 반박 논리 분석 버튼** — Output 3의 각 제안별로 심층 분석
-- **CR (Change Request) 자동 인식** — Reason for change, Summary of change 추출
-- **다양한 문서 형식** — `.docx`, `.doc`, `.pptx`, `.pdf` 모두 지원
+**v2.6 — Cross-audited Stability Release (10개 수정)**
+- 🔒 **Fix A** — Gemini API 락 통합 (개인 키 즉시 429 진짜 원인 해결)
+- 🧵 **Fix B** — 워커 스레드 안전 로깅 (timestamp + 스레드명 prefix, 자동 flush)
+- 🧹 **Fix C, D** — 메모리/디스크 누수 차단 (wb.close 보장 + docm_unzip 즉시 정리)
+- 🛡️ **Fix E** — PDF 바이너리 폴백 제거 (LLM 할루시네이션 방지) + 스킵 배너
+- 🔐 **Fix F** — ZipSlip 방어 (os.path.commonpath 기반)
+- 🍎 **Fix G** — macOS `._` 아티팩트 자동 제외
+- 💾 **Fix H** — 빈 모델 리스트 캐시 안 함 (transient 오류 복구)
+- 🔄 **Fix I** — 심층 분석 실패 시에도 UI 즉시 갱신
+- 📄 **Fix J** — 결론 헤더 매칭 완전 재작성 (`"3 Conclusion:"` 등 71개 케이스 100% 통과)
+
+**v2.5 — Audit 수정 (안정성 강화)**
+- 심층 분석 success 변수 / UI 갱신 / 슬라이더 / Pro 폴백 / 503 / Flash-Lite / 디스크 청소 8개 버그 수정
+
+**v2.4 — 전체 안정성 개선**
+- 모델 직접 선택, 호출 간격 슬라이더, Direct 임계값 50, 디스크 청소 안전화, 더블클릭 방지
+
+**v2.3 — 키 오염 버그 수정**
+- 동시 사용자 환경에서 개인 API 키가 즉시 429 받던 문제 차단
         """)
 
     # Step 1: Input
@@ -2105,7 +2480,6 @@ elif page == "🚀 통합 분석기":
 
     if input_method == "🔍 회의 번호로 자동 조회":
         col_wg, col_num = st.columns([1, 2])
-
         with col_wg:
             wg = st.selectbox("Working Group:", list(WG_FTP_MAP.keys()))
 
@@ -2119,7 +2493,6 @@ elif page == "🚀 통합 분석기":
             meeting_num_input = st.text_input(
                 "회의 번호 입력 후 Enter ↵ (예: 133bis, 122, 168):",
                 placeholder="133bis",
-                help="3GPP 회의 번호만 입력 후 Enter를 누르세요."
             )
 
         if meeting_num_input and meeting_num_input.strip():
@@ -2127,7 +2500,7 @@ elif page == "🚀 통합 분석기":
             st.info("✅ 회의 번호 입력 완료 — 아래 **Agenda 불러오기** 버튼을 클릭하세요.")
 
             if st.button("📋 Agenda 불러오기", type="primary"):
-                with st.spinner(f"{wg}#{meeting_num} 폴더 검색 및 TDoc 리스트 다운로드 중..."):
+                with st.spinner(f"{wg}#{meeting_num} 폴더 검색 중..."):
                     meeting_folder = resolve_meeting_folder(wg, meeting_num)
                     if meeting_folder:
                         st.session_state["resolved_folder"] = meeting_folder
@@ -2135,14 +2508,9 @@ elif page == "🚀 통합 분석기":
                         st.session_state.agenda_dict = agenda_dict
                         st.session_state.all_entries = all_entries
                         if not agenda_dict:
-                            st.error(
-                                f"❌ TDoc 리스트를 찾지 못했습니다. "
-                                f"폴더 `{meeting_folder}`는 존재하지만 xlsx 파일을 다운로드하지 못했습니다."
-                            )
+                            st.error(f"❌ TDoc 리스트를 찾지 못했습니다.")
                     else:
-                        st.error(
-                            f"❌ {wg}#{meeting_num}에 해당하는 폴더를 찾지 못했습니다."
-                        )
+                        st.error(f"❌ {wg}#{meeting_num} 폴더를 찾지 못했습니다.")
                         st.session_state.agenda_dict = {}
                         st.session_state.all_entries = []
 
@@ -2206,6 +2574,9 @@ elif page == "🚀 통합 분석기":
             st.session_state.extracted_data = []
             st.session_state.notebooklm_txt = None
             st.session_state.deep_analysis_cache = {}
+            st.session_state.deep_analysis_inflight = set()
+            # v2.6 Fix E: PDF skip 카운터 리셋
+            st.session_state.pdf_skip_count = 0
 
             progress_container = st.container()
             with progress_container:
@@ -2231,6 +2602,17 @@ elif page == "🚀 통합 분석기":
             st.session_state.process_done = True
 
     if st.session_state.process_done:
+        # v2.6 Fix E: PDF 스킵 발생 시 사용자에게 명시적 안내
+        # (st.toast 대신 st.warning — 기존 코드 UI 일관성)
+        pdf_skipped = st.session_state.get("pdf_skip_count", 0)
+        if pdf_skipped > 0:
+            st.warning(
+                f"⚠️ **{pdf_skipped}개의 PDF 문서가 처리되지 않았습니다** "
+                f"(PyMuPDF 라이브러리 미설치).\n\n"
+                f"해당 문서는 Output 3 (AI 분석)에서 자동 제외됩니다. "
+                f"서버 관리자가 `pip install PyMuPDF`를 실행하면 다음 분석부터 처리됩니다."
+            )
+
         st.success("🎉 기본 분석 완료! Output 1·2를 다운로드하세요.")
 
         agenda_tag = _safe_filename(st.session_state.get("selected_agenda_name", ""), 30)
@@ -2256,270 +2638,42 @@ elif page == "🚀 통합 분석기":
         # Step 3: Gemini AI 정밀 분석
         st.markdown("---")
         st.header("3️⃣ AI 정밀 분석 (Gemini)")
-        st.write("추출된 결론을 Gemini AI로 의미 분석하여 더 정확한 제안 그룹핑 및 회사 정렬을 생성합니다.")
+        st.write("추출된 결론을 Gemini AI로 의미 분석합니다.")
 
         st.warning(
             "⏱️ **소요 시간 안내:** 무료 Gemini API는 분당 처리량이 제한되어 있습니다. "
-            "문서 수에 따라 **약 5~15분** 이상 소요될 수 있으며, API 과부하 시 자동으로 "
-            "대기 후 재시도합니다. **분석이 끝날 때까지 페이지를 닫지 마시고 느긋하게 기다려 주세요.**"
+            "문서 수에 따라 **약 5~15분** 이상 소요될 수 있습니다."
         )
+
+        # v2.4: 모델 선택 UI
+        st.markdown("#### 🎯 분석 모델 선택")
+        model_choice_label = st.radio(
+            "모델 선택:",
+            list(MODEL_DISPLAY_OPTIONS.values()),
+            index=0,  # Flash 자동이 기본
+            horizontal=False,
+        )
+        # 라벨에서 키로 역변환
+        model_choice = next(k for k, v in MODEL_DISPLAY_OPTIONS.items() if v == model_choice_label)
+        st.session_state.ai_model_choice = model_choice
+
+        manual_model_name = ""
+        if model_choice == "manual":
+            # 키가 있어야 가용 모델 조회 가능 — 그 전엔 안내만
+            st.info("💡 API 키를 아래에 입력한 후 가용 모델 목록을 보여드립니다.")
 
         api_key_to_use = None
 
         if GEMINI_API_KEY:
             key_mode = st.radio(
                 "API 키 선택:",
-                ("🔑 서버 기본 키 사용 (별도 설정 불필요)", "🔐 내 개인 Gemini API 키 사용"),
+                ("🔑 서버 기본 키 사용", "🔐 내 개인 Gemini API 키 사용"),
                 horizontal=True,
             )
             if "개인" in key_mode:
-                with st.expander("📖 개인 API 키 발급 방법 (1분이면 끝! 완전 무료)", expanded=True):
+                with st.expander("📖 개인 API 키 발급 방법", expanded=True):
                     st.markdown("""
-**1단계:** [Google AI Studio - API 키 발급 페이지](https://aistudio.google.com/app/apikey)
-**2단계:** **'Create API key'** → **'Create API key in new project'** ⚠️ 반드시 in new project 선택!
-**3단계:** `AIzaSy...`로 시작하는 키를 복사하여 아래에 붙여넣기
-
-✅ **완전 무료**, 카드 등록 불필요, 하루 1,500회까지 무료
-                    """)
-
-                personal_key = st.text_input(
-                    "개인 Gemini API Key 입력:",
-                    type="password",
-                    placeholder="AIzaSy...",
-                )
-                if personal_key and personal_key.strip():
-                    # ★ v2.3 추가: 키 형식 사전 검증
-                    cleaned_key = personal_key.strip()
-                    if not cleaned_key.startswith("AIza"):
-                        st.error(
-                            "❌ **키 형식이 올바르지 않습니다.**\n\n"
-                            "Gemini API 키는 `AIza`로 시작해야 합니다. "
-                            "앞뒤 공백이나 줄바꿈이 포함되지 않았는지 확인하세요."
-                        )
-                    elif len(cleaned_key) < 35:
-                        st.error(
-                            "❌ **키 길이가 너무 짧습니다.**\n\n"
-                            "Gemini API 키는 약 39자입니다. 복사가 잘렸을 수 있으니 다시 확인하세요."
-                        )
-                    else:
-                        api_key_to_use = cleaned_key
-                else:
-                    st.caption("⬆️ 위에 개인 API 키를 입력하세요.")
-            else:
-                api_key_to_use = GEMINI_API_KEY
-        else:
-            st.info("서버에 기본 API 키가 설정되어 있지 않습니다. 개인 Gemini API 키를 입력해주세요.")
-
-            with st.expander("📖 API 키 발급 방법 (1분이면 끝! 완전 무료)", expanded=True):
-                st.markdown("""
-**1단계:** [Google AI Studio - API 키 발급 페이지](https://aistudio.google.com/app/apikey)
-**2단계:** **'Create API key'** → **'Create API key in new project'** ⚠️ 반드시 in new project 선택!
-**3단계:** `AIzaSy...`로 시작하는 키를 복사하여 아래에 붙여넣기
-
-✅ **완전 무료**, 카드 등록 불필요
-                """)
-
-            personal_key = st.text_input(
-                "Gemini API Key 입력:",
-                type="password",
-                placeholder="AIzaSy...",
-            )
-            if personal_key and personal_key.strip():
-                cleaned_key = personal_key.strip()
-                if not cleaned_key.startswith("AIza"):
-                    st.error("❌ 키 형식 오류 — `AIza`로 시작하는지, 공백이 없는지 확인하세요.")
-                elif len(cleaned_key) < 35:
-                    st.error("❌ 키 길이가 너무 짧습니다. 복사가 잘렸을 수 있습니다.")
-                else:
-                    api_key_to_use = cleaned_key
-
-        if api_key_to_use:
-            st.markdown("")
-            st.markdown("#### 👇 준비가 되었으면 아래 버튼을 클릭하세요")
-            if st.button("✨ Gemini AI 정밀 분석 시작", use_container_width=True, type="primary"):
-                gemini_container = st.container()
-                with gemini_container:
-                    st.subheader("🧠 Gemini AI 분석 진행 상황")
-                    gemini_progress = st.progress(0)
-                    gemini_status = st.empty()
-                    gemini_detail = st.empty()
-
-                    total_docs = len(st.session_state.extracted_data)
-                    if total_docs == 0:
-                        st.warning("⚠️ 추출된 문서가 없습니다. 먼저 기본 분석을 실행하세요.")
-                    elif total_docs > 20:
-                        total_batches = (total_docs + 19) // 20
-                        gemini_detail.caption(
-                            f"📋 {total_docs}개 문서를 {total_batches}개 그룹으로 나누어 분석합니다. "
-                            f"무료 API 기준 약 {max(5, total_batches * 2)}~{max(10, total_batches * 3 + 5)}분 소요 예상."
-                        )
-                    else:
-                        gemini_detail.caption(
-                            f"📋 {total_docs}개 문서를 일괄 분석합니다. 약 5~10분 소요 예상."
-                        )
-
-                    if total_docs > 0:
-                        run_gemini_analysis(st.session_state.extracted_data, gemini_status, api_key_to_use)
-
-        if st.session_state.ai_summary_generated:
-            st.success("✅ AI 정밀 요약 완료!")
-            st.download_button(
-                f"📥 Output 3 (AI 정밀 요약 - {st.session_state.ai_model_name}.docx)",
-                data=st.session_state.ai_summary_bytes,
-                file_name=f"Output3_AI_Summary_{agenda_tag}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                type="primary", use_container_width=True)
-
-            proposals = _parse_ai_summary_into_proposals(st.session_state.ai_summary_text)
-
-            st.markdown("""
-<style>
-div.stButton > button[kind="primary"] {
-    background-color: #FF4B4B;
-    color: white;
-    border: 2px solid #D32F2F;
-    font-weight: bold;
-    font-size: 1.05em;
-    padding: 0.6em 1em;
-    box-shadow: 0 2px 6px rgba(255,75,75,0.3);
-    transition: all 0.2s ease;
-}
-div.stButton > button[kind="primary"]:hover {
-    background-color: #D32F2F;
-    box-shadow: 0 4px 12px rgba(255,75,75,0.5);
-    transform: translateY(-1px);
-}
-</style>
-            """, unsafe_allow_html=True)
-
-            with st.expander("👀 AI 분석 결과 미리보기 + 심층 분석", expanded=True):
-                if not proposals:
-                    st.markdown(st.session_state.ai_summary_text)
-                else:
-                    st.info(f"💡 총 {len(proposals)}개 제안 그룹이 추출되었습니다. 각 제안 아래 **'근거 및 반박 논리 분석'** 버튼을 누르면 해당 주장의 **논거·반박·전략적 함의**를 깊이 분석합니다.")
-
-                    for p_idx, prop in enumerate(proposals):
-                        st.markdown(prop["full_block"])
-
-                        if not prop["doc_ids"]:
-                            st.caption("ℹ️ 이 제안에는 문서 번호가 없어 심층 분석을 할 수 없습니다.")
-                            st.markdown("---")
-                            continue
-
-                        cache_key = (prop['header'], tuple(sorted(prop['doc_ids'])))
-
-                        col_btn, col_info = st.columns([2, 3])
-                        with col_btn:
-                            btn_clicked = st.button(
-                                "🔍 근거 및 반박 논리 분석",
-                                key=f"deep_btn_{p_idx}",
-                                type="primary",
-                                use_container_width=True
-                            )
-                        with col_info:
-                            preview_docs = _select_docs_for_deep_analysis(
-                                prop["doc_ids"], st.session_state.extracted_data, max_docs=5
-                            )
-                            if preview_docs:
-                                preview_str = ", ".join([f"{d['company']}" for d in preview_docs])
-                                st.caption(f"📋 분석 대상 {len(preview_docs)}개사: {preview_str}")
-
-                        if btn_clicked:
-                            with st.spinner(f"🔍 '{prop['header'][:50]}...' 심층 분석 중... (약 20~40초)"):
-                                selected_docs = _select_docs_for_deep_analysis(
-                                    prop["doc_ids"], st.session_state.extracted_data, max_docs=5
-                                )
-                                if not selected_docs:
-                                    st.error("❌ 분석할 문서가 메모리에 없습니다. 기본 분석을 다시 실행해주세요.")
-                                else:
-                                    deep_api_key = api_key_to_use or GEMINI_API_KEY
-                                    if not deep_api_key:
-                                        st.error("❌ API 키가 설정되지 않았습니다.")
-                                    else:
-                                        success, result = run_deep_analysis(
-                                            prop["header"], prop["body"],
-                                            selected_docs, deep_api_key
-                                        )
-                                        if success:
-                                            if cache_key in st.session_state.deep_analysis_cache:
-                                                del st.session_state.deep_analysis_cache[cache_key]
-                                            elif len(st.session_state.deep_analysis_cache) >= 30:
-                                                oldest = next(iter(st.session_state.deep_analysis_cache))
-                                                del st.session_state.deep_analysis_cache[oldest]
-                                            st.session_state.deep_analysis_cache[cache_key] = result
-                                            st.rerun()
-                                        else:
-                                            st.error(f"❌ 심층 분석 실패: {result}")
-
-                        if cache_key in st.session_state.deep_analysis_cache:
-                            with st.container():
-                                st.markdown("---")
-                                st.markdown(f"#### 🔬 심층 분석 결과 — {prop['header'].replace('###','').strip()}")
-                                st.markdown(st.session_state.deep_analysis_cache[cache_key])
-
-                        st.markdown("---")
-
-        # Step 4: NotebookLM
-        st.markdown("---")
-        st.header("4️⃣ Google NotebookLM 활용하기 (대안)")
-        st.success(
-            "💡 **환각(Hallucination) 제로!** NotebookLM은 오직 업로드한 문서 기반으로만 "
-            "답변을 생성하여 압도적인 정확도를 자랑합니다."
-        )
-
-        col_a, col_b = st.columns([2, 1])
-        with col_a:
-            st.markdown("""
-**[NotebookLM의 압도적 장점]**
-* **제한 없는 속도 & 무료:** 복잡한 API 키 발급이나 토큰 초과 에러 없이 **완전 무료**로 즉시 사용!
-* **초대용량 지원:** 노트북 당 **최대 50개의 파일**, 파일당 **최대 50만 단어**까지 한 번에 분석.
-* **투명한 출처 표기:** 원문 인용(Citation) 링크 제공.
-            """)
-        with col_b:
-            if st.session_state.notebooklm_txt:
-                st.download_button(
-                    label="📝 NotebookLM 전용 텍스트(.txt) 다운로드",
-                    data=st.session_state.notebooklm_txt.encode('utf-8'),
-                    file_name=f"NotebookLM_Conclusions_{agenda_tag}.txt",
-                    mime="text/plain",
-                    type="primary",
-                    use_container_width=True,
-                )
-
-        st.markdown("---")
-        st.markdown("#### 📋 1분 만에 끝내는 NotebookLM 완벽 요약 가이드")
-        st.markdown("1. 위 버튼을 눌러 **텍스트 파일(.txt)**을 내 PC에 저장합니다.")
-        st.markdown("2. 👉 **[Google NotebookLM 공식 사이트](https://notebooklm.google.com/)** 에 접속하여 로그인합니다.")
-        st.markdown("3. **'새 노트북(New Notebook)'** 버튼을 누르고, 좌측 소스 탭에 `.txt` 파일을 끌어다 놓습니다.")
-
-        st.error(
-            "🚨 **[중요] 무한 로딩 현상 대처:** 파일 업로드 후 우측 패널에서 파일명 옆에 "
-            "체크표시가 안 뜨고 계속 빙글빙글 돌면, 화면상 표기 버그일 뿐 실제로는 분석이 끝난 상태입니다! "
-            "**그냥 채팅창에 질문 전송**하거나 **F5(새로고침)**를 한 번 눌러주세요."
-        )
-
-        st.markdown("4. 하단 채팅창에 아래 **전문가용 프롬프트**를 붙여넣고 전송!")
-
-        notebooklm_prompt = """당신은 3GPP 표준화 회의의 전문 기술 분석가입니다.
-제공된 모든 기고문 원문을 꼼꼼히 검토하고, 아래의 [분석 지침]과 [출력 양식]을 엄격하게 준수하여 분석 보고서를 작성해 주세요.
-
-[분석 지침]
-1. 필터링: "2개 이상의 회사"가 공통으로 지지하거나 유사한 기술적 주장을 하는 제안(Proposal)만 추출하세요. 1개 회사만 단독 주장한 내용은 제외합니다.
-2. CR(Change Request) 문서: "Summary of change" 내용을 해당 회사의 제안으로 취급하세요.
-3. 그룹화: 단어 형태가 달라도 '기술적 핵심 의미와 목적'이 동일하면 하나의 그룹으로 묶되, 뭉뚱그리지 마세요.
-4. 같은 주제라도 제안 방향이 다르면 별도 그룹입니다.
-5. 정렬: 지지 회사 수가 가장 많은 그룹부터 내림차순 정렬.
-6. 회사 그룹 통합: ZTE=Sanechips, Huawei=HiSilicon, Nokia=Nokia Shanghai Bell은 같은 회사로 취급.
-7. 제약사항: 오직 제공된 소스 문서에 명시된 내용, 회사명, 문서 번호만 사용.
-
-[출력 양식]
-### [순위]. [제안의 구체적 동작 요약 제목]
-* **지지 회사 (총 N개사):** 회사명1, 회사명2, ...
-* **상세 제안 내용:** 해당 제안의 기술적 배경과 핵심 요구사항을 2~3문장으로 요약
-* **근거 문서:**
-  - [문서번호] (회사명): 원문 핵심 내용 요약
-  - [문서번호] (회사명): 원문 핵심 내용 요약"""
-        st.code(notebooklm_prompt, language="text")
-
-    with st.expander("📝 처리 로그", expanded=False):
-        st.text(st.session_state.log_text)
+**1단계:** [Google AI Studio](https://aistudio.google.com/app/apikey)
+**2단계:** **Create API key** → **Create API key in new project** ⚠️ 반드시 in new project!
+**3단계:** `AIzaSy...` 키 복사 → 아래 붙여넣기
+     
