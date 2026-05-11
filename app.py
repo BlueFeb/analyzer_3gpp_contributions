@@ -2672,8 +2672,279 @@ elif page == "🚀 통합 분석기":
             )
             if "개인" in key_mode:
                 with st.expander("📖 개인 API 키 발급 방법", expanded=True):
-                    st.markdown("""
+                    st.markdown("**1단계:** [Google AI Studio](https://aistudio.google.com/app/apikey)")
+                    st.markdown("**2단계:** **Create API key** → **Create API key in new project** ⚠️ 반드시 in new project!")
+                    st.markdown("**3단계:** `AIzaSy...` 키 복사 → 아래 붙여넣기")
+
+                personal_key = st.text_input(
+                    "개인 Gemini API Key 입력:",
+                    type="password",
+                    placeholder="AIzaSy...",
+                )
+                if personal_key and personal_key.strip():
+                    cleaned_key = personal_key.strip()
+                    if not cleaned_key.startswith("AIza"):
+                        st.error("❌ 키는 `AIza`로 시작해야 합니다. 앞뒤 공백 확인.")
+                    elif len(cleaned_key) < 35:
+                        st.error("❌ 키 길이가 너무 짧습니다.")
+                    else:
+                        api_key_to_use = cleaned_key
+                else:
+                    st.caption("⬆️ 위에 개인 API 키를 입력하세요.")
+            else:
+                api_key_to_use = GEMINI_API_KEY
+        else:
+            st.info("서버에 기본 API 키가 설정되어 있지 않습니다.")
+            with st.expander("📖 API 키 발급 방법", expanded=True):
+                st.markdown("""
 **1단계:** [Google AI Studio](https://aistudio.google.com/app/apikey)
-**2단계:** **Create API key** → **Create API key in new project** ⚠️ 반드시 in new project!
-**3단계:** `AIzaSy...` 키 복사 → 아래 붙여넣기
-     
+**2단계:** **Create API key** → **Create API key in new project**
+**3단계:** `AIzaSy...` 키 복사
+                """)
+            personal_key = st.text_input(
+                "Gemini API Key 입력:",
+                type="password",
+                placeholder="AIzaSy...",
+            )
+            if personal_key and personal_key.strip():
+                cleaned_key = personal_key.strip()
+                if not cleaned_key.startswith("AIza"):
+                    st.error("❌ 키 형식 오류")
+                elif len(cleaned_key) < 35:
+                    st.error("❌ 키 길이 부족")
+                else:
+                    api_key_to_use = cleaned_key
+
+        # v2.4: 수동 모델 선택 UI (키 입력 후)
+        if api_key_to_use and model_choice == "manual":
+            try:
+                with st.spinner("가용 모델 조회 중..."):
+                    valid_models = _get_cached_models(api_key_to_use)
+                if valid_models:
+                    # 표시용으로 짧은 이름 추출
+                    short_names = [m.split("/")[-1] for m in valid_models]
+                    selected_short = st.selectbox(
+                        "사용할 모델 선택:",
+                        short_names,
+                        help="가용 모델 중 직접 선택. 'flash'가 들어간 모델 권장."
+                    )
+                    manual_model_name = selected_short
+                    st.session_state.ai_manual_model_name = manual_model_name
+                else:
+                    st.error("가용 모델 목록을 가져오지 못했습니다.")
+            except Exception as e:
+                err = str(e)
+                if api_key_to_use in err:
+                    err = err.replace(api_key_to_use, "***HIDDEN***")
+                st.error(f"모델 조회 오류: {err[:200]}")
+
+        if api_key_to_use:
+            # 모델 검증 (수동 모드 외에는 자동 매칭 결과 미리보기)
+            if model_choice != "manual":
+                try:
+                    preview_target, preview_display = _resolve_model_for_choice(
+                        api_key_to_use, model_choice, ""
+                    )
+                    if preview_target:
+                        st.success(f"✅ 선택된 모델: **{preview_display}**")
+                    else:
+                        st.warning(f"⚠️ {preview_display}")
+                except Exception:
+                    pass
+
+            st.markdown("#### 👇 준비가 되었으면 아래 버튼을 클릭하세요")
+            if st.button("✨ Gemini AI 정밀 분석 시작", use_container_width=True, type="primary"):
+                gemini_container = st.container()
+                with gemini_container:
+                    st.subheader("🧠 Gemini AI 분석 진행 상황")
+                    gemini_status = st.empty()
+                    gemini_detail = st.empty()
+
+                    total_docs = len(st.session_state.extracted_data)
+                    if total_docs == 0:
+                        st.warning("⚠️ 추출된 문서가 없습니다.")
+                    elif total_docs > 50:
+                        total_batches = (total_docs + 49) // 50
+                        gemini_detail.caption(
+                            f"📋 {total_docs}개 문서를 {total_batches}개 배치로 분석. 약 {max(5, total_batches * 2)}분 소요."
+                        )
+                    else:
+                        gemini_detail.caption(
+                            f"📋 {total_docs}개 문서를 일괄 분석 (Direct 모드). 약 3~10분 소요."
+                        )
+
+                    if total_docs > 0:
+                        run_gemini_analysis(
+                            st.session_state.extracted_data,
+                            gemini_status,
+                            api_key_to_use,
+                            model_choice=model_choice,
+                            manual_model_name=manual_model_name,
+                            call_interval=st.session_state.ai_call_interval,
+                        )
+
+        if st.session_state.ai_summary_generated:
+            st.success("✅ AI 정밀 요약 완료!")
+            st.download_button(
+                f"📥 Output 3 (AI 정밀 요약 - {st.session_state.ai_model_name}.docx)",
+                data=st.session_state.ai_summary_bytes,
+                file_name=f"Output3_AI_Summary_{agenda_tag}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary", use_container_width=True)
+
+            proposals = _parse_ai_summary_into_proposals(st.session_state.ai_summary_text)
+
+            st.markdown("""
+<style>
+div.stButton > button[kind="primary"] {
+    background-color: #FF4B4B;
+    color: white;
+    border: 2px solid #D32F2F;
+    font-weight: bold;
+}
+</style>
+            """, unsafe_allow_html=True)
+
+            with st.expander("👀 AI 분석 결과 미리보기 + 심층 분석", expanded=True):
+                if not proposals:
+                    st.markdown(st.session_state.ai_summary_text)
+                else:
+                    st.info(f"💡 총 {len(proposals)}개 제안 그룹. **'근거 및 반박 논리 분석'** 버튼을 누르면 심층 분석.")
+
+                    for p_idx, prop in enumerate(proposals):
+                        st.markdown(prop["full_block"])
+
+                        if not prop["doc_ids"]:
+                            st.caption("ℹ️ 문서 번호가 없어 심층 분석을 할 수 없습니다.")
+                            st.markdown("---")
+                            continue
+
+                        cache_key = (prop['header'], tuple(sorted(prop['doc_ids'])))
+                        # v2.4: 진행 중 키 추적 (더블클릭 방지)
+                        is_inflight = cache_key in st.session_state.deep_analysis_inflight
+                        is_cached = cache_key in st.session_state.deep_analysis_cache
+
+                        col_btn, col_info = st.columns([2, 3])
+                        with col_btn:
+                            btn_label = "🔄 분석 중..." if is_inflight else "🔍 근거 및 반박 논리 분석"
+                            btn_clicked = st.button(
+                                btn_label,
+                                key=f"deep_btn_{p_idx}",
+                                type="primary",
+                                use_container_width=True,
+                                disabled=is_inflight,  # v2.4: 진행 중 비활성화
+                            )
+                        with col_info:
+                            preview_docs = _select_docs_for_deep_analysis(
+                                prop["doc_ids"], st.session_state.extracted_data, max_docs=5
+                            )
+                            if preview_docs:
+                                preview_str = ", ".join([f"{d['company']}" for d in preview_docs])
+                                st.caption(f"📋 분석 대상 {len(preview_docs)}개사: {preview_str}")
+
+                        if btn_clicked and not is_inflight:
+                            # v2.4: 진행 중 표시
+                            st.session_state.deep_analysis_inflight.add(cache_key)
+                            # v2.5 수정: success 변수를 try 진입 전에 초기화
+                            # (어느 분기에서 함수 호출에 실패해도 finally에서 안전하게 참조 가능)
+                            success = False
+                            try:
+                                with st.spinner(f"🔍 '{prop['header'][:50]}...' 심층 분석 중..."):
+                                    selected_docs = _select_docs_for_deep_analysis(
+                                        prop["doc_ids"], st.session_state.extracted_data, max_docs=5
+                                    )
+                                    if not selected_docs:
+                                        st.error("❌ 분석할 문서가 메모리에 없습니다.")
+                                    else:
+                                        deep_api_key = api_key_to_use or GEMINI_API_KEY
+                                        if not deep_api_key:
+                                            st.error("❌ API 키가 설정되지 않았습니다.")
+                                        else:
+                                            success, result = run_deep_analysis(
+                                                prop["header"], prop["body"],
+                                                selected_docs, deep_api_key,
+                                                model_choice=model_choice,
+                                                manual_model_name=manual_model_name,
+                                            )
+                                            if success:
+                                                if cache_key in st.session_state.deep_analysis_cache:
+                                                    del st.session_state.deep_analysis_cache[cache_key]
+                                                elif len(st.session_state.deep_analysis_cache) >= 30:
+                                                    oldest = next(iter(st.session_state.deep_analysis_cache))
+                                                    del st.session_state.deep_analysis_cache[oldest]
+                                                st.session_state.deep_analysis_cache[cache_key] = result
+                                            else:
+                                                st.error(f"❌ 심층 분석 실패: {result}")
+                            finally:
+                                # v2.6 Fix I (Supplement 2 통합):
+                                # CRITICAL — rerun 전에 inflight 해제. 다음 렌더 사이클에서
+                                # 버튼이 "분석 중" 상태로 잘못 disabled되는 것 방지.
+                                # finally는 항상 실행되므로 예외 발생해도 안전하게 해제됨.
+                                st.session_state.deep_analysis_inflight.discard(cache_key)
+                            # v2.6 Fix I: success/실패 무관하게 rerun.
+                            # 성공 → 캐시된 결과 표시.
+                            # 실패 → 에러 메시지가 이미 표시됐고, 버튼이 다시 enable됨을 즉시 반영.
+                            # 무한 루프 위험 없음 — rerun 후 다음 렌더에서는
+                            # btn_clicked가 False로 리셋되므로 이 분기 재진입 안 함.
+                            if btn_clicked:
+                                st.rerun()
+
+                        if is_cached:
+                            with st.container():
+                                st.markdown("---")
+                                st.markdown(f"#### 🔬 심층 분석 결과 — {prop['header'].replace('###','').strip()}")
+                                st.markdown(st.session_state.deep_analysis_cache[cache_key])
+
+                        st.markdown("---")
+
+        # Step 4: NotebookLM
+        st.markdown("---")
+        st.header("4️⃣ Google NotebookLM 활용하기 (대안)")
+        st.success("💡 **환각 제로!** NotebookLM은 오직 업로드한 문서 기반으로만 답변.")
+
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            st.markdown("""
+**[NotebookLM 장점]**
+* **완전 무료**, 토큰 초과 없음
+* **초대용량 지원** (노트북당 50개 파일, 파일당 50만 단어)
+* **출처 표기 (Citation)**
+            """)
+        with col_b:
+            if st.session_state.notebooklm_txt:
+                st.download_button(
+                    label="📝 NotebookLM 전용 텍스트(.txt) 다운로드",
+                    data=st.session_state.notebooklm_txt.encode('utf-8'),
+                    file_name=f"NotebookLM_Conclusions_{agenda_tag}.txt",
+                    mime="text/plain",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+        st.markdown("---")
+        st.markdown("#### 📋 NotebookLM 사용법")
+        st.markdown("1. 위 버튼으로 **.txt** 저장")
+        st.markdown("2. [Google NotebookLM](https://notebooklm.google.com/) 접속")
+        st.markdown("3. **새 노트북** → .txt 업로드")
+        st.markdown("4. 채팅창에 아래 프롬프트 붙여넣기:")
+
+        notebooklm_prompt = """당신은 3GPP 표준화 회의의 전문 기술 분석가입니다.
+
+[분석 지침]
+1. 2개 이상 회사가 공통 주장한 제안만 추출
+2. CR 문서의 "Summary of change"도 포함
+3. 그룹화: 기술적 핵심 의미가 동일하면 묶되, 광범위 그룹 금지
+4. 같은 주제라도 방향 다르면 별도 그룹
+5. 지지 회사 수 내림차순
+6. 회사 그룹: ZTE=Sanechips, Huawei=HiSilicon, Nokia=Nokia Shanghai Bell
+
+[출력]
+### [순위]. [제안 제목]
+* **지지 회사 (총 N개사):** ...
+* **상세 내용:** 2-3문장
+* **근거 문서:**
+  - [문서번호] (회사명): 핵심 내용"""
+        st.code(notebooklm_prompt, language="text")
+
+    with st.expander("📝 처리 로그", expanded=False):
+        st.text(st.session_state.log_text)
