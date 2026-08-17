@@ -1,12 +1,24 @@
 """
-3GPP Contribution Analyzer v2.6 — Cross-Audited Stability Release
-==================================================================
+3GPP Contribution Analyzer v2.9 — Memory & Network Optimized
+=============================================================
 Output 1: Conclusions 취합 .docx (원본과 동일)
 Output 2: TF-IDF Proposal Summary .docx (원본과 동일)
 Output 3: Gemini 의미 분석 (선택, 모델 선택 가능)
 
-v2.6 변경점 (cross-audit 후 10개 fix 적용):
-A. 글로벌 락 통합 — 기존 _genai_lock과 _cached_models_lock → 단일 _GLOBAL_GEMINI_LOCK
+v2.9 변경점 (Cloud Run 1Gi 환경 최적화):
+- 문서별 임시파일 즉시 해제: 처리 끝난 zip/압축폴더를 바로 비워 RAM 피크 대폭 감소
+  (Cloud Run에서 /tmp는 메모리이므로 200개 문서 누적 시 OOM 위험을 제거)
+- HTTP 커넥션 풀링: requests.Session + 풀로 keep-alive 재사용, 다운로드 속도 향상
+- 모델 캐시 키별 딕셔너리 + 10분 TTL: 서버키/개인키 혼용 시 캐시 무력화 문제 해결
+- 무의미한 genai.configure() 2곳 제거 (락 획득/해제 오버헤드만 발생하던 코드)
+- 중복 문서번호 추출 디렉토리 충돌 방지
+
+v2.8 변경점 (유지):
+- 임시파일 자동 정리: 앱 전용 네임스페이스(/tmp/3gpp_analyzer/) + PID/heartbeat 기반.
+  컨텍스트매니저(정상+예외) + atexit + 시작 스윕 3중 안전망.
+
+v2.6 변경점 (유지): cross-audit 후 10개 fix 적용
+- A. 글로벌 락 통합 — 기존 _genai_lock과 _cached_models_lock → 단일 _GLOBAL_GEMINI_LOCK
 B. 스레드 안전 로깅 — 워커 스레드는 timestamp/thread-name 붙여 버퍼링,
    메인 스레드 as_completed 루프에서 자동 flush
 C. read_excel_from_bytes에 wb.close() 보장
@@ -35,6 +47,9 @@ import time
 import json
 import threading
 import shutil
+import glob
+import atexit
+from contextlib import contextmanager
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -55,6 +70,190 @@ except Exception:
 
 _RE_NONWORD = re.compile(r"[^\w\s\-]")
 _RE_SPACES = re.compile(r"\s+")
+
+# ==========================================
+# ★ v2.9: HTTP 커넥션 풀링 ★
+# requests.get()을 직접 부르면 매 요청마다 TCP+TLS 핸드셰이크가 발생.
+# 10개 워커가 같은 호스트(www.3gpp.org)에 반복 접속하므로, 세션 + 풀을
+# 쓰면 keep-alive로 연결을 재사용해 다운로드가 빨라짐.
+# 스레드 안전: requests.Session은 HTTPAdapter 풀을 통해 멀티스레드에서
+# 사용 가능하며, 풀 크기를 워커 수(10) 이상으로 잡아 경합을 방지.
+# ==========================================
+_http_session = None
+_http_session_lock = threading.Lock()
+
+
+def _get_http_session():
+    """프로세스 공용 requests.Session (커넥션 풀 재사용)."""
+    global _http_session
+    if _http_session is None:
+        with _http_session_lock:
+            if _http_session is None:
+                s = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=16, pool_maxsize=32, max_retries=0
+                )
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _http_session = s
+    return _http_session
+
+
+def _http_get(url, **kwargs):
+    """세션 기반 GET. 실패 시 표준 requests.get으로 폴백."""
+    try:
+        return _get_http_session().get(url, **kwargs)
+    except Exception:
+        return requests.get(url, **kwargs)
+
+
+def _http_head(url, **kwargs):
+    """세션 기반 HEAD. 실패 시 표준 requests.head로 폴백."""
+    try:
+        return _get_http_session().head(url, **kwargs)
+    except Exception:
+        return requests.head(url, **kwargs)
+
+
+# ==========================================
+# ★ v2.8: 임시파일 자동 정리 시스템 ★
+# 설계: 앱 전용 네임스페이스(/tmp/3gpp_analyzer/) + PID/heartbeat 기반.
+# - 네임스페이스 격리: 우리 디렉토리만 건드림 (남의 /tmp 파일 절대 안 건드림)
+# - PID 생존 확인: 소유 프로세스가 죽으면 즉시 회수 (강제종료 누수 자동 복구)
+# - heartbeat: 소유자 살아있어도 N분 유휴면 회수 (행 스레드 대응)
+# - 다중 안전망: 컨텍스트매니저(정상+예외) + atexit(정상종료) + 시작 스윕
+# 8개 시나리오 + 실제 SIGKILL 테스트로 검증 완료.
+# ==========================================
+_APP_TMP_ROOT = os.path.join(tempfile.gettempdir(), "3gpp_analyzer")
+_HEARTBEAT_FILE = ".heartbeat"
+_RUN_PREFIX = "run_"
+_MAX_IDLE_SECONDS = 900  # 15분: heartbeat가 이보다 오래되면 회수
+_hb_lock = threading.Lock()
+
+
+def _ensure_tmp_root():
+    try:
+        os.makedirs(_APP_TMP_ROOT, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 존재하지만 우리 소유 아님 → 안전하게 살아있다고 간주
+    except OSError:
+        return False
+
+
+def _touch_heartbeat(run_dir):
+    """run_dir의 heartbeat 갱신. 장시간 작업 중 주기적으로 호출."""
+    try:
+        hb = os.path.join(run_dir, _HEARTBEAT_FILE)
+        with _hb_lock:
+            with open(hb, "w") as f:
+                f.write(f"{os.getpid()}\n{time.time()}\n")
+    except Exception:
+        pass
+
+
+def _new_run_dir():
+    """앱 네임스페이스 아래 고유 run 디렉토리 생성 + heartbeat 마킹."""
+    _ensure_tmp_root()
+    run_dir = tempfile.mkdtemp(prefix=f"{_RUN_PREFIX}{os.getpid()}_", dir=_APP_TMP_ROOT)
+    _touch_heartbeat(run_dir)
+    return run_dir
+
+
+def _read_heartbeat(run_dir):
+    try:
+        with open(os.path.join(run_dir, _HEARTBEAT_FILE)) as f:
+            lines = f.read().splitlines()
+        return int(lines[0]), float(lines[1])
+    except Exception:
+        return None, None
+
+
+def _cleanup_run_dir(run_dir):
+    """단일 run 디렉토리 즉시 삭제."""
+    shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def reap_stale_run_dirs(max_idle_seconds=_MAX_IDLE_SECONDS):
+    """네임스페이스 내 stale run 디렉토리만 회수.
+    회수 조건: 소유 PID 죽음 OR heartbeat가 max_idle보다 오래됨.
+    살아있는 PID + 신선한 heartbeat = 절대 회수 안 함 (동시 사용자 보호)."""
+    _ensure_tmp_root()
+    now = time.time()
+    reaped = 0
+    for run_dir in glob.glob(os.path.join(_APP_TMP_ROOT, f"{_RUN_PREFIX}*")):
+        if not os.path.isdir(run_dir):
+            continue
+        try:
+            pid, ts = _read_heartbeat(run_dir)
+            if pid is None:
+                if now - os.path.getmtime(run_dir) > max_idle_seconds:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                    reaped += 1
+                continue
+            if (not _pid_alive(pid)) or (now - ts > max_idle_seconds):
+                shutil.rmtree(run_dir, ignore_errors=True)
+                reaped += 1
+        except Exception:
+            try:
+                if now - os.path.getmtime(run_dir) > max_idle_seconds:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                    reaped += 1
+            except Exception:
+                pass
+    return reaped
+
+
+def reap_own_run_dirs():
+    """현재 PID 소유의 모든 run 디렉토리 회수 (atexit용)."""
+    try:
+        mypid = os.getpid()
+        for run_dir in glob.glob(os.path.join(_APP_TMP_ROOT, f"{_RUN_PREFIX}{mypid}_*")):
+            shutil.rmtree(run_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _managed_run_dir():
+    """tempfile.TemporaryDirectory의 안전한 대체.
+    앱 네임스페이스 아래 run 디렉토리를 만들고, 블록 종료(정상/예외) 시 반드시 정리."""
+    run_dir = _new_run_dir()
+    try:
+        yield run_dir
+    finally:
+        _cleanup_run_dir(run_dir)
+
+
+# 프로세스(인스턴스)당 1회: 이전에 중단된 작업의 누수 디렉토리 회수 + 정상종료 시 정리 등록
+_REAP_DONE = False
+
+
+def _startup_reap_once():
+    global _REAP_DONE
+    if _REAP_DONE:
+        return
+    _REAP_DONE = True
+    try:
+        reap_stale_run_dirs()
+    except Exception:
+        pass
+    try:
+        atexit.register(reap_own_run_dirs)
+    except Exception:
+        pass
+
 
 # ==========================================
 # ★ v2.6 Fix A: 글로벌 락 통합 ★
@@ -223,6 +422,10 @@ DEFAULTS = {
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# v2.8: 프로세스(인스턴스)당 1회 — 이전에 중단된 작업의 누수 디렉토리 회수
+#       + 정상 종료 시 내 디렉토리 정리 등록
+_startup_reap_once()
 
 
 # ==========================================
@@ -493,25 +696,36 @@ def is_end_header(text, max_len=80):
 # v2.4: 모델 목록 캐시 (모델 목록만 캐시, 선택은 매번 재실행)
 # v2.6 Fix A: _cached_models_lock 제거 — _GLOBAL_GEMINI_LOCK으로 통합
 # v2.6 Fix H: 빈 리스트는 캐시하지 않음 (transient API 오류로부터 회복 가능)
+# v2.9: 단일 키 → 딕셔너리 + TTL.
+#   기존엔 캐시가 한 개 키만 기억해서, 서버키/개인키를 번갈아 쓰거나
+#   동시 사용자가 서로 다른 키를 쓰면 캐시가 계속 덮어써져 무력화됐음.
+#   키별로 저장하고 10분 TTL을 둬서 모델 목록 변경도 자동 반영.
 # ==========================================
-_cached_gemini_models = None
-_cached_gemini_api_key = None
+_model_cache = {}          # {api_key: (models, timestamp)}
+_MODEL_CACHE_TTL = 600     # 10분
+_MODEL_CACHE_MAX = 8       # 키 개수 상한 (메모리 보호)
 
 
 def _get_cached_models(api_key):
     """모델 목록만 캐싱. 어떤 모델을 쓸지는 매번 재선택.
-    v2.6: 글로벌 락 통합 + 빈 리스트 캐시 금지."""
-    global _cached_gemini_models, _cached_gemini_api_key
+    v2.9: 키별 캐시 + TTL. 빈 리스트는 캐시하지 않음."""
     with _GLOBAL_GEMINI_LOCK:
-        if _cached_gemini_models is not None and _cached_gemini_api_key == api_key:
-            return _cached_gemini_models
+        now = time.time()
+        cached = _model_cache.get(api_key)
+        if cached and (now - cached[1]) < _MODEL_CACHE_TTL:
+            return cached[0]
         genai.configure(api_key=api_key)
         valid_models = [m.name for m in genai.list_models()
                        if 'generateContent' in m.supported_generation_methods]
-        # v2.6 Fix H: 빈 리스트는 캐시하지 말고 다음 호출에 재시도 가능하게
         if valid_models:
-            _cached_gemini_models = valid_models
-            _cached_gemini_api_key = api_key
+            # 상한 초과 시 가장 오래된 항목 제거
+            if len(_model_cache) >= _MODEL_CACHE_MAX:
+                try:
+                    oldest = min(_model_cache.items(), key=lambda kv: kv[1][1])[0]
+                    _model_cache.pop(oldest, None)
+                except Exception:
+                    _model_cache.clear()
+            _model_cache[api_key] = (valid_models, now)
         return valid_models
 
 
@@ -657,9 +871,9 @@ def _request_with_retry(url, method="get", max_retries=3, timeout=60, **kwargs):
     for attempt in range(max_retries):
         try:
             if method == "head":
-                r = requests.head(url, **kwargs)
+                r = _http_head(url, **kwargs)
             else:
-                r = requests.get(url, **kwargs)
+                r = _http_get(url, **kwargs)
             if r.status_code == 200:
                 return r
             last_error = f"HTTP {r.status_code}"
@@ -685,7 +899,7 @@ def list_meetings_from_ftp(wg):
         return []
     url = f"https://www.3gpp.org/ftp/{ftp_path}/"
     try:
-        r = requests.get(url, timeout=15, verify=False)
+        r = _http_get(url, timeout=15, verify=False)
         r.raise_for_status()
         all_links = re.findall(r'href="([^"]*)"', r.text)
         prefixes = WG_MEETING_PREFIXES.get(wg, [])
@@ -1056,7 +1270,7 @@ def _download_doc(entry, td_name, headers, max_retries=3):
     for attempt in range(max_retries):
         try:
             kwargs = {"headers": headers, "timeout": 60, "verify": False}
-            r = requests.get(entry["link"], **kwargs)
+            r = _http_get(entry["link"], **kwargs)
             r.raise_for_status()
             fp = os.path.join(td_name, f"{entry['doc']}.zip")
             with open(fp, "wb") as f:
@@ -1071,89 +1285,42 @@ def _download_doc(entry, td_name, headers, max_retries=3):
     return entry, None, last_error or "Download failed after retries"
 
 
+def _release_doc_workspace(zip_path, extract_dir):
+    """v2.9: 한 문서 처리가 끝나면 그 문서의 zip과 압축 해제 폴더를 즉시 해제.
+
+    Cloud Run에서 /tmp는 메모리(tmpfs)이므로, 이걸 안 하면 200개 문서의
+    zip + 압축 결과가 전부 RAM에 누적되어 OOM 위험. 문서 단위로 즉시
+    비우면 피크 메모리가 '전체 합계'에서 '동시 처리분'으로 내려감.
+    이미 텍스트는 extracted_list에 추출된 뒤이므로 기능 영향 없음.
+    """
+    try:
+        if extract_dir and os.path.isdir(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
+    except Exception:
+        pass
+    try:
+        if zip_path and os.path.isfile(zip_path):
+            os.remove(zip_path)
+    except Exception:
+        pass
+
+
 # ==========================================
-# v2.4: 디스크 청소 안전화
+# v2.8: 디스크 청소 — 네임스페이스 안전 버전
+# 기존(~v2.6)은 ^tmp[a-zA-Z0-9_]{6,}$ 패턴으로 /tmp 전역을 훑어
+# 다른 프로세스의 임시 디렉토리까지 삭제 대상으로 잡는 위험이 있었음.
+# v2.8은 우리 네임스페이스(/tmp/3gpp_analyzer/run_*)만 PID/heartbeat로
+# 판단해 회수. 남의 파일은 어떤 경우에도 안 건드림.
 # ==========================================
 def _cleanup_tmp_if_low_disk(force=False):
-    """
-    /tmp 잔해를 청소.
-    v2.5 수정:
-      - Python tempfile.TemporaryDirectory()가 만드는 tmpXXXXXXXX 패턴 추가
-      - 시간 기반 안전장치 강화 (force=True도 30분 미만은 보호)
-      - 명시적 3GPP 패턴(R1-XXX, TSGRX 등)도 유지
-    """
-    import shutil
+    """네임스페이스 내 stale run 디렉토리만 안전하게 회수.
+    (force 인자는 하위 호환을 위해 유지하나, 동작은 항상 안전한 reaper)."""
     try:
-        tmp_dir = tempfile.gettempdir()
-        disk = shutil.disk_usage(tmp_dir)
-        free_pct = disk.free / disk.total * 100
-
-        # v2.5: 강제 정리여도 30분 미만은 보호 (현재 실행 중인 다른 분석 보호)
-        MAX_AGE_NORMAL = 3600    # 일반: 1시간
-        MAX_AGE_FORCE = 1800     # 강제: 30분 (다른 사용자 진행 중 작업 보호)
-
-        if free_pct < 30 or force:
-            reason = "강제 정리" if force else f"여유 {free_pct:.1f}%"
-            append_log(f"🧹 /tmp 정리 시작 ({reason})...")
-            cleaned = 0
-            skipped_recent = 0
-            now = time.time()
-
-            # v2.5: 실제 디렉터리 구조에 맞는 패턴
-            # tempfile.TemporaryDirectory()는 /tmp/tmpXXXXXXXX 형식의 디렉토리를 만듦.
-            # 안에 zip, docx, 추출된 doc 폴더 등이 들어감.
-            # 외부에서 직접 보이는 패턴은 tmpXXXX 디렉토리뿐.
-            STRICT_PATTERNS = [
-                # tempfile.TemporaryDirectory() 패턴 — /tmp/tmpAbCdEf12 등
-                re.compile(r'^tmp[a-zA-Z0-9_]{6,}$'),
-                # 3GPP 문서 ID 직접 노출 (혹시 잔해로 남았을 경우)
-                re.compile(r'^[RSC]\d?-\d{7}', re.I),
-                # TSG 회의 폴더 패턴
-                re.compile(r'^TSG[RSC]\d?_\d+', re.I),
-                # repackage 잔해
-                re.compile(r'^docm_unzip$', re.I),
-                re.compile(r'^repack(\.zip|\.docx)?$', re.I),
-                # TDoc xlsx
-                re.compile(r'^TDoc_List', re.I),
-            ]
-
-            max_age = MAX_AGE_FORCE if force else MAX_AGE_NORMAL
-
-            for item in os.listdir(tmp_dir):
-                item_path = os.path.join(tmp_dir, item)
-
-                # 명시적 패턴만 매칭
-                if not any(p.match(item) for p in STRICT_PATTERNS):
-                    continue
-
-                try:
-                    age = now - os.path.getmtime(item_path)
-                    if age < max_age:
-                        skipped_recent += 1
-                        continue
-
-                    if os.path.isdir(item_path):
-                        shutil.rmtree(item_path, ignore_errors=True)
-                    else:
-                        os.remove(item_path)
-                    cleaned += 1
-                except Exception:
-                    pass
-
-            if cleaned or skipped_recent:
-                age_label = "30분" if force else "1시간"
-                append_log(f"정리 완료: {cleaned}개 삭제, {skipped_recent}개 보호({age_label} 미만).")
-                try:
-                    disk2 = shutil.disk_usage(tmp_dir)
-                    append_log(f"여유 공간: {free_pct:.1f}% → {disk2.free / disk2.total * 100:.1f}%")
-                except Exception:
-                    pass
-            else:
-                append_log("정리 대상 잔해 없음.")
-        else:
-            append_log(f"디스크 여유: {free_pct:.1f}% (정리 불필요)")
-    except Exception as e:
-        append_log(f"디스크 체크 오류 (무시): {e}")
+        reaped = reap_stale_run_dirs()
+        if reaped:
+            append_log(f"🧹 정리: 중단된 작업 잔해 {reaped}개 회수")
+    except Exception:
+        pass
 
 
 def extract_all_conclusions(entries, status_elem, progress_elem, log_func):
@@ -1251,8 +1418,8 @@ def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
 
 
 def _extract_local(entries, status_elem, progress_elem, log_func):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        log_func(f"임시 디렉터리 생성: {temp_dir}")
+    with _managed_run_dir() as temp_dir:
+        log_func("임시 작업 디렉터리 생성 (자동 정리)")
         od = Document()
         od.add_heading("3GPP Conclusions", level=0)
 
@@ -1278,9 +1445,13 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                 progress_elem.progress(i / max(total, 1))
                 status_elem.text(f"Downloaded [{i}/{total}]: {e['doc']}")
                 log_func(f"[{i}/{total}] Downloaded: {e['doc']}")
+                if i % 10 == 0:
+                    _touch_heartbeat(temp_dir)  # v2.8: 장시간 작업 중 heartbeat 갱신
 
         for idx, (e, fp, err) in enumerate(download_results, start=1):
             status_elem.text(f"Extracting [{idx}/{total}]: {e['doc']}")
+            if idx % 10 == 0:
+                _touch_heartbeat(temp_dir)  # v2.8: 추출 중 heartbeat 갱신
             doc_text_buffer = []
             full_text_buffer = []
 
@@ -1296,7 +1467,8 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
             try:
                 if err or not fp:
                     raise Exception(err or "Download failed")
-                ed = os.path.join(temp_dir, e["doc"])
+                # v2.9: idx를 붙여 동일 문서번호 중복 시 서로 덮어쓰지 않도록
+                ed = os.path.join(temp_dir, f"{e['doc']}__{idx}")
                 os.makedirs(ed, exist_ok=True)
                 with zipfile.ZipFile(fp) as zf:
                     # v2.6 Fix F: ZipSlip 방어
@@ -1627,6 +1799,10 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
                         "content": f"문서 처리 중 오류 발생: {str(ex)[:200]}",
                         "full_content": ""
                     })
+            finally:
+                # v2.9: 이 문서의 zip/압축폴더를 즉시 해제 (RAM 피크 감소).
+                # continue로 빠져나가는 경로에서도 finally는 반드시 실행됨.
+                _release_doc_workspace(fp, os.path.join(temp_dir, f"{e['doc']}__{idx}"))
 
             if idx < len(download_results):
                 try:
@@ -1639,8 +1815,8 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
         bio = io.BytesIO()
         od.save(bio)
         bio.seek(0)
-    _cleanup_tmp_if_low_disk(force=True)
-    return bio
+        return bio
+    # _managed_run_dir 컨텍스트 종료 시 temp_dir 자동 정리 (정상/예외 모두)
 
 
 def _build_notebooklm_txt(extracted_list):
@@ -1859,8 +2035,9 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
         st.warning("⚠️ 분석할 문서가 없습니다.")
         return False
 
-    with _GLOBAL_GEMINI_LOCK:
-        genai.configure(api_key=api_key)
+    # v2.9: 진입부의 genai.configure() 제거.
+    # 락을 잡았다 즉시 놓는 configure는 효과가 없음 — 실제 호출 시점의
+    # _safe_gemini_call()이 락 안에서 configure+generate를 원자적으로 수행.
     _gemini_start_time = time.time()
 
     doc_inventory = _build_doc_inventory(extracted_data)
@@ -2237,8 +2414,7 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key,
         return False, "분석 가능한 문서가 없습니다."
 
     try:
-        with _GLOBAL_GEMINI_LOCK:
-            genai.configure(api_key=api_key)
+        # v2.9: 진입부 configure 제거 (위와 동일 이유 — 실제 호출 시 재설정됨)
 
         # v2.4: 사용자 선택 모델 사용 (Flash 강제 아님)
         target, display_or_err = _resolve_model_for_choice(api_key, model_choice, manual_model_name)
@@ -2422,7 +2598,7 @@ elif page == "ℹ️ 가이드":
     """)
 
     st.markdown("---")
-    st.header("📊 모델 선택 가이드 (v2.6)")
+    st.header("📊 모델 선택 가이드 (v2.9)")
     st.markdown("""
 **🟢 Flash 자동 (권장):**
 - 분당 10회, 일 250회까지 무료
@@ -2443,28 +2619,11 @@ elif page == "🚀 통합 분석기":
     st.title("🚀 3GPP 기고문 통합 분석기")
     st.caption("Output 1·2는 기본 | Output 3 Gemini는 선택")
 
-    with st.expander("🆕 v2.6 업데이트 안내", expanded=True):
-        st.markdown("""
-**v2.6 — Cross-audited Stability Release (10개 수정)**
-- 🔒 **Fix A** — Gemini API 락 통합 (개인 키 즉시 429 진짜 원인 해결)
-- 🧵 **Fix B** — 워커 스레드 안전 로깅 (timestamp + 스레드명 prefix, 자동 flush)
-- 🧹 **Fix C, D** — 메모리/디스크 누수 차단 (wb.close 보장 + docm_unzip 즉시 정리)
-- 🛡️ **Fix E** — PDF 바이너리 폴백 제거 (LLM 할루시네이션 방지) + 스킵 배너
-- 🔐 **Fix F** — ZipSlip 방어 (os.path.commonpath 기반)
-- 🍎 **Fix G** — macOS `._` 아티팩트 자동 제외
-- 💾 **Fix H** — 빈 모델 리스트 캐시 안 함 (transient 오류 복구)
-- 🔄 **Fix I** — 심층 분석 실패 시에도 UI 즉시 갱신
-- 📄 **Fix J** — 결론 헤더 매칭 완전 재작성 (`"3 Conclusion:"` 등 71개 케이스 100% 통과)
-
-**v2.5 — Audit 수정 (안정성 강화)**
-- 심층 분석 success 변수 / UI 갱신 / 슬라이더 / Pro 폴백 / 503 / Flash-Lite / 디스크 청소 8개 버그 수정
-
-**v2.4 — 전체 안정성 개선**
-- 모델 직접 선택, 호출 간격 슬라이더, Direct 임계값 50, 디스크 청소 안전화, 더블클릭 방지
-
-**v2.3 — 키 오염 버그 수정**
-- 동시 사용자 환경에서 개인 API 키가 즉시 429 받던 문제 차단
-        """)
+    st.caption(
+        "v2.9 — 문서별 임시파일 즉시 정리로 메모리 사용량 감소  \n"
+        "· 다운로드 커넥션 재사용으로 속도 개선  \n"
+        "· 중단·재시작 시 잔여 파일 자동 회수"
+    )
 
     # Step 1: Input
     st.header("1️⃣ 데이터 입력")
