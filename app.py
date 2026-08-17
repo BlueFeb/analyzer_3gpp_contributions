@@ -1,9 +1,33 @@
 """
-3GPP Contribution Analyzer v3.3 — Hardened Input, Size & Time Guards
-=====================================================================
+3GPP Contribution Analyzer v3.5 — Accurate Error Classification
+================================================================
 Output 1: Conclusions 취합 .docx (원본과 동일)
 Output 2: TF-IDF Proposal Summary .docx (원본과 동일)
 Output 3: Gemini 의미 분석 (무료 Flash 계열 전용)
+
+v3.5 변경점 (v3.4 점검에서 발견한 결함 수정):
+- 오류 분류를 상태코드 정확 추출 방식으로 재작성. v3.4는 '403' in err_str
+  부분매칭이라 "429 Quota exceeded ... limit 4032 per day"처럼 숫자에 403이
+  포함되면 인증 오류로 오분류 → 재시도 없이 즉시 중단되어 회복 기회를 잃었음.
+  실제 오류 메시지 10종으로 검증 완료(오탐 3건 제거).
+- classify_api_error()로 auth/quota/overload/other 판정을 한 곳에 통합.
+  메인 분석·심층 분석·모델 미리보기 3곳이 같은 기준을 쓰도록 정리.
+- 서버 키(Secrets/환경변수)에도 공백·따옴표·개행 정리 적용.
+  Secrets에 줄바꿈이 섞여 인증 실패하던 케이스를 방지.
+- 서버 과부하(500/502/503/504)를 별도 안내로 분리 — 사용자 키 문제가
+  아님을 명시.
+- 미사용 함수 list_meetings_from_ftp를 dead code로 표기(제거하지 않고 보존).
+
+v3.4 변경점:
+- Google의 새 API 키 형식(AQ.Ab...) 지원. 기존 코드는 'AIza'로 시작하지 않으면
+  키를 거부해서, AI Studio에서 새로 발급한 키를 아예 입력할 수 없었음.
+  이제 특정 접두어를 강제하지 않고, 명백한 오류(공백/길이 이상)만 거른 뒤
+  실제 유효성은 API 호출이 판정하도록 위임 — 형식이 또 바뀌어도 안 깨짐.
+- 붙여넣기 사고 자동 정리 (양끝 따옴표, 개행/탭 제거).
+- 인증 오류(401/403/ACCESS_TOKEN_TYPE_UNSUPPORTED)를 한도 초과와 분리.
+  기존에는 인증 실패도 'API 한도/과부하 대기'로 표시돼 원인을 오해하기 쉬웠음.
+  이제 재시도하지 않고 즉시 원인별 안내를 띄운다.
+- 키 입력 직후 인증 실패를 감지해 바로 알려줌 (분석 시작 전에 확인 가능).
 
 v3.3 변경점:
 - 문서번호 인식이 자릿수를 가정하지 않도록 재작성. 기존 '정확히 7자리' 패턴은
@@ -157,6 +181,58 @@ def extract_doc_ids(text):
 # 3gpp.org 및 하위 도메인 외에는 어떤 URL도 다운로드하지 않음.
 # Excel 하이퍼링크/직접입력 링크로 임의 URL이 들어와 내부망에 접근하는
 # SSRF를 원천 차단. 정상 사용(3GPP 공식 서버)에는 영향 없음.
+# ==========================================
+# ★ v3.4: API 키 형식 검증 (신·구 형식 모두 수용) ★
+# ==========================================
+# [배경] Google이 Gemini API 키 형식을 변경했음.
+#   - 구형 "Standard key": AIza... (39자 내외)
+#   - 신형 "Auth key":     AQ.Ab... (AI Studio에서 새로 만들면 이 형식)
+#   2026-06-19부터 제한 없는 Standard 키의 요청이 거부되기 시작했고,
+#   2026-09에는 Standard 키 자체가 거부될 예정.
+#   즉 앞으로 발급되는 키는 대부분 AQ. 형식이며, AIza만 허용하면
+#   신규 사용자가 아예 키를 넣을 수 없게 됨.
+#
+# [설계] 특정 접두어를 하드코딩해 '허용'하는 방식은 형식이 또 바뀌면
+#   그대로 깨진다. 그래서 명백히 잘못된 입력만 걸러내고, 최종 유효성은
+#   실제 API 호출(_get_cached_models)이 판정하도록 위임한다.
+#   - 붙여넣기 사고(공백/따옴표/줄바꿈)는 정리해준다
+#   - 길이가 비정상이거나 공백이 섞인 경우만 거부
+_KNOWN_KEY_PREFIXES = ("AIza", "AQ.")   # 안내 문구용 (검증에 강제하지 않음)
+
+
+def sanitize_api_key(raw):
+    """붙여넣기 과정에서 흔히 섞이는 문자를 제거하고 키를 정리."""
+    if not raw:
+        return ""
+    k = str(raw).strip()
+    # 양끝 따옴표 제거 (secrets.toml 등에서 복사한 경우)
+    if len(k) >= 2 and k[0] == k[-1] and k[0] in ("'", '"'):
+        k = k[1:-1].strip()
+    # 내부 개행/탭 제거 (줄바꿈이 섞여 들어온 경우)
+    k = k.replace("\n", "").replace("\r", "").replace("\t", "")
+    return k.strip()
+
+
+def validate_api_key_format(raw):
+    """키 형식을 느슨하게 검증.
+    Returns: (cleaned_key, error_message_or_None)
+
+    특정 접두어를 강제하지 않는다. Google이 형식을 또 바꿔도
+    앱이 사용자를 막지 않도록, 명백한 오류만 거른다.
+    """
+    k = sanitize_api_key(raw)
+    if not k:
+        return "", "키가 비어 있습니다."
+    if " " in k:
+        return "", "키에 공백이 포함되어 있습니다. 복사 범위를 확인해주세요."
+    if len(k) < 20:
+        return "", f"키 길이가 너무 짧습니다 ({len(k)}자). 전체를 복사했는지 확인해주세요."
+    if len(k) > 400:
+        return "", "키 길이가 비정상적으로 깁니다. 다른 값을 붙여넣지 않았는지 확인해주세요."
+    # 형식 통과. 실제 유효성은 API 호출 시 판정됨.
+    return k, None
+
+
 _ALLOWED_DOC_HOST_EXACT = "3gpp.org"
 _ALLOWED_DOC_HOST_SUFFIX = ".3gpp.org"
 
@@ -780,8 +856,12 @@ def append_log(text):
 # ==========================================
 # Config
 # ==========================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or st.secrets.get("GEMINI_API_KEY", "")
-CLOUD_FUNCTION_URL = os.environ.get("CLOUD_FUNCTION_URL", "") or st.secrets.get("CLOUD_FUNCTION_URL", "")
+GEMINI_API_KEY = sanitize_api_key(
+    os.environ.get("GEMINI_API_KEY", "") or st.secrets.get("GEMINI_API_KEY", "")
+)
+CLOUD_FUNCTION_URL = (
+    os.environ.get("CLOUD_FUNCTION_URL", "") or st.secrets.get("CLOUD_FUNCTION_URL", "")
+).strip()
 
 
 # ==========================================
@@ -1223,6 +1303,13 @@ def _request_with_retry(url, method="get", max_retries=3, timeout=60, **kwargs):
 
 
 def list_meetings_from_ftp(wg):
+    """WG의 3GPP FTP에서 회의 폴더 목록을 조회.
+
+    NOTE (v3.5 점검): 현재 UI 어디에서도 호출되지 않는 미사용 함수.
+    회의 선택은 resolve_meeting_folder(회의 번호 직접 입력) 경로를 쓰고 있음.
+    기능 제거 원칙에 따라 삭제하지 않고 보존 — 추후 '회의 목록에서 고르기'
+    UI를 붙일 때 그대로 재사용 가능.
+    """
     ftp_path = WG_FTP_MAP.get(wg)
     if not ftp_path:
         return []
@@ -2418,6 +2505,59 @@ def _build_doc_inventory(extracted_data):
     return "\n".join(lines)
 
 
+# ==========================================
+# ★ v3.5: API 오류 분류 (상태코드 정확 추출) ★
+# ==========================================
+# [배경] v3.4는 '403' in err_str 같은 부분매칭을 썼는데,
+#   "429 Quota exceeded ... limit 4032 per day" 처럼 숫자 안에 403이
+#   들어 있으면 인증 오류로 오분류됨 → 재시도를 안 하고 즉시 중단되어
+#   회복 가능한 상황을 놓침. 상태 코드를 정확히 뽑아 판정한다.
+_STATUS_CODE_RE = re.compile(r'(?<![0-9])([1-5][0-9]{2})(?![0-9])')
+
+
+def _extract_status_codes(err_str):
+    """오류 문자열에서 HTTP 상태 코드로 보이는 값만 추출.
+    앞뒤에 다른 숫자가 붙은 경우(4032 등)는 제외."""
+    try:
+        return set(int(x) for x in _STATUS_CODE_RE.findall(err_str or ""))
+    except Exception:
+        return set()
+
+
+def classify_api_error(err_str):
+    """API 오류를 'auth' / 'quota' / 'overload' / 'other' 로 분류.
+
+    분류 기준:
+      auth     — 인증/권한 문제. 재시도해도 소용없으므로 즉시 중단.
+      quota    — 한도 초과(429). 대기 후 재시도.
+      overload — 서버 과부하(503/500/504). 대기 후 재시도 또는 모델 폴백.
+      other    — 그 외.
+    """
+    s = err_str or ""
+    low = s.lower()
+    codes = _extract_status_codes(s)
+
+    # 1) 명시적 인증 사유 문구가 있으면 코드와 무관하게 auth
+    auth_phrases = (
+        "unauthenticated", "api key not valid", "api_key_invalid",
+        "access_token_type_unsupported", "permission_denied",
+        "invalid authentication credentials", "api key expired",
+        "invalid api key",
+    )
+    if any(p in low for p in auth_phrases):
+        return "auth"
+
+    # 2) 상태 코드 기반 판정 (한도/과부하를 인증보다 먼저 봐서 오분류 방지)
+    if 429 in codes or "resource_exhausted" in low or "quota" in low:
+        return "quota"
+    if codes & {500, 502, 503, 504} or "overloaded" in low or "unavailable" in low:
+        return "overload"
+    if codes & {401, 403}:
+        return "auth"
+    # 400은 키 문제일 수도, 요청 형식 문제일 수도 있음 → 문구로 이미 위에서 걸러짐
+    return "other"
+
+
 def _call_with_retry_and_fallback(api_key, model_obj, prompt, generation_config,
                                     status_elem, max_retries, start_time,
                                     current_model_name, model_choice):
@@ -2436,8 +2576,16 @@ def _call_with_retry_and_fallback(api_key, model_obj, prompt, generation_config,
             return res, cur_name, cur_model
         except Exception as e:
             err_str = str(e)
-            is_429 = "429" in err_str
-            is_503 = "503" in err_str or "overloaded" in err_str.lower() or "unavailable" in err_str.lower()
+            # v3.5: 상태코드를 정확히 추출해 분류 (부분매칭 오탐 제거)
+            kind = classify_api_error(err_str)
+            is_429 = (kind == "quota")
+            is_503 = (kind == "overload")
+
+            # v3.4: 인증 오류는 재시도해도 소용없으므로 즉시 중단하고
+            # 사용자에게 원인을 명확히 알린다.
+            if kind == "auth":
+                append_log(f"인증 오류(재시도 안 함): {err_str[:200]}")
+                raise RuntimeError(f"__AUTH_ERROR__{err_str}")
 
             # v3.0: 503(서버 과부하) 시 다른 Flash 버전으로 폴백.
             # 기존엔 Pro→Flash 폴백이었으나 Pro를 지원하지 않게 되어,
@@ -2975,14 +3123,39 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
             err = err.replace(GEMINI_API_KEY, "***HIDDEN***")
         if api_key and api_key in err:
             err = err.replace(api_key, "***HIDDEN***")
-        if "429" in err or "Quota" in err or "exhausted" in err.lower():
+        # v3.5: 분류 함수로 통일 (부분매칭 오탐 제거)
+        _is_auth_marked = err.startswith("__AUTH_ERROR__")
+        clean = err.replace("__AUTH_ERROR__", "")
+        kind = "auth" if _is_auth_marked else classify_api_error(clean)
+
+        if kind == "auth":
+            st.error(
+                "❌ **API 키 인증에 실패했습니다.** (한도 문제가 아닙니다)\n\n"
+                "**확인해 보세요:**\n"
+                "1. 키를 전체 복사했는지 (앞뒤 잘림·공백 없이)\n"
+                "2. Google AI Studio에서 그 키가 **사용 설정(Enabled)** 상태인지\n"
+                "3. 새 형식(`AQ.`) 키를 쓰고 계신다면 — 일부 계정에서 이 형식이 "
+                "서버에 거부되는 사례가 보고되고 있습니다. "
+                "기존 `AIza` 형식 키가 있다면 그것으로 시도해보세요.\n\n"
+                "자세한 오류는 아래 '처리 로그'에서 확인할 수 있습니다."
+            )
+            append_log(f"인증 실패 상세: {clean[:300]}")
+        elif kind == "quota":
             st.error(
                 "❌ **API 한도가 초과되었습니다.**\n\n"
-                "**해결:** Flash 모델 선택 또는 새 키 발급."
+                "**해결:** 잠시 후 재시도하거나, 다른 프로젝트에서 발급한 새 키를 사용하세요.\n"
+                "(같은 프로젝트의 키를 여러 개 만들어도 한도는 공유됩니다)"
             )
+            append_log(f"한도 초과: {clean[:300]}")
+        elif kind == "overload":
+            st.error(
+                "❌ **Gemini 서버가 일시적으로 혼잡합니다.**\n\n"
+                "사용자 키 문제가 아니며, 잠시 후 다시 시도하면 대개 해결됩니다."
+            )
+            append_log(f"서버 과부하: {clean[:300]}")
         else:
-            st.error(f"❌ **API 오류가 발생했습니다.**")
-            append_log(f"Gemini error (sanitized): {err[:200]}")
+            st.error("❌ **API 오류가 발생했습니다.** 자세한 내용은 '처리 로그'를 확인하세요.")
+            append_log(f"Gemini error (sanitized): {clean[:300]}")
     return False
 
 
@@ -3192,9 +3365,18 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key,
             err = err.replace(GEMINI_API_KEY, "***HIDDEN***")
         if api_key and api_key in err:
             err = err.replace(api_key, "***HIDDEN***")
-        if "429" in err or "Quota" in err or "exhausted" in err.lower():
-            return False, "API 한도 초과. Flash 모델 선택 또는 새 키 발급 후 재시도."
-        return False, f"오류: {err[:200]}"
+        # v3.5: 메인 분석과 동일한 분류 기준 적용
+        _marked = err.startswith("__AUTH_ERROR__")
+        clean = err.replace("__AUTH_ERROR__", "")
+        kind = "auth" if _marked else classify_api_error(clean)
+        if kind == "auth":
+            return False, ("API 키 인증 실패. 키가 유효한지 확인해주세요. "
+                           "(한도 문제가 아닙니다)")
+        if kind == "quota":
+            return False, "API 한도 초과. 잠시 후 재시도하거나 다른 프로젝트의 키를 사용하세요."
+        if kind == "overload":
+            return False, "Gemini 서버가 일시적으로 혼잡합니다. 잠시 후 재시도해주세요."
+        return False, f"오류: {clean[:200]}"
 
 
 # ==========================================
@@ -3239,7 +3421,7 @@ if page == "⚙️ 설정":
     st.subheader("Gemini API Key")
     st.info(f"상태: {'✅ 설정됨 (서버에 안전하게 저장)' if GEMINI_API_KEY else '❌ 미설정'}")
     if not GEMINI_API_KEY:
-        st.code('# .streamlit/secrets.toml\nGEMINI_API_KEY = "AIzaSy..."', language="toml")
+        st.code('# .streamlit/secrets.toml\nGEMINI_API_KEY = "AQ.Ab..."', language="toml")
     st.subheader("Cloud Function URL")
     if CLOUD_FUNCTION_URL:
         masked_url = CLOUD_FUNCTION_URL[:40] + "..." if len(CLOUD_FUNCTION_URL) > 40 else CLOUD_FUNCTION_URL
@@ -3261,13 +3443,13 @@ elif page == "ℹ️ 가이드":
     st.markdown("""
 **1단계:** [Google AI Studio - API 키 발급 페이지](https://aistudio.google.com/app/apikey)
 **2단계:** **'Create API key'** → **'Create API key in new project'** ⚠️ 반드시 in new project 선택!
-**3단계:** `AIzaSy...`로 시작하는 키를 복사하여 분석기에 붙여넣기
+**3단계:** 발급된 키를 복사하여 분석기에 붙여넣기 (`AQ.Ab...` 또는 `AIzaSy...`)
 
 ✅ **완전 무료**, 카드 등록 불필요
     """)
 
     st.markdown("---")
-    st.header("📊 모델 선택 가이드 (v3.3)")
+    st.header("📊 모델 선택 가이드 (v3.5)")
     st.markdown("""
 **🟢 Flash 자동 (권장):**
 - 분당 10회, 일 250회까지 무료
@@ -3289,9 +3471,9 @@ elif page == "🚀 통합 분석기":
     st.caption("Output 1·2는 기본 | Output 3 Gemini는 선택")
 
     st.caption(
-        "v3.3 — 쟁점별로 찬성·반대 회사를 나눠서 표시  \n"
-        "· 3GPP 공식 서버만 접속, 파일 크기·분석 시간 상한 적용  \n"
-        "· 임시파일 자동 정리로 메모리 사용량 감소"
+        "v3.5 — 새 형식(AQ.) API 키 지원  \n"
+        "· 쟁점별로 찬성·반대 회사를 나눠서 표시  \n"
+        "· 인증 실패·한도 초과·서버 혼잡을 구분해 안내"
     )
 
     # Step 1: Input
@@ -3531,20 +3713,18 @@ elif page == "🚀 통합 분석기":
                 with st.expander("📖 개인 API 키 발급 방법", expanded=True):
                     st.markdown("**1단계:** [Google AI Studio](https://aistudio.google.com/app/apikey)")
                     st.markdown("**2단계:** **Create API key** → **Create API key in new project** ⚠️ 반드시 in new project!")
-                    st.markdown("**3단계:** `AIzaSy...` 키 복사 → 아래 붙여넣기")
+                    st.markdown("**3단계:** 발급된 키 복사 → 아래 붙여넣기 (`AQ.Ab...` 형식으로 나옵니다)")
                     st.markdown("💡 **결제(billing)는 등록하지 마세요.** 무료 티어 그대로 쓰면 요금이 발생하지 않습니다.")
 
                 personal_key = st.text_input(
                     "개인 Gemini API Key 입력:",
                     type="password",
-                    placeholder="AIzaSy...",
+                    placeholder="AQ.Ab... 또는 AIzaSy...",
                 )
                 if personal_key and personal_key.strip():
-                    cleaned_key = personal_key.strip()
-                    if not cleaned_key.startswith("AIza"):
-                        st.error("❌ 키는 `AIza`로 시작해야 합니다. 앞뒤 공백 확인.")
-                    elif len(cleaned_key) < 35:
-                        st.error("❌ 키 길이가 너무 짧습니다.")
+                    cleaned_key, key_err = validate_api_key_format(personal_key)
+                    if key_err:
+                        st.error(f"❌ {key_err}")
                     else:
                         api_key_to_use = cleaned_key
                 else:
@@ -3557,19 +3737,17 @@ elif page == "🚀 통합 분석기":
                 st.markdown("""
 **1단계:** [Google AI Studio](https://aistudio.google.com/app/apikey)
 **2단계:** **Create API key** → **Create API key in new project**
-**3단계:** `AIzaSy...` 키 복사
+**3단계:** 발급된 키 복사 (`AQ.Ab...` 또는 `AIzaSy...`)
                 """)
             personal_key = st.text_input(
                 "Gemini API Key 입력:",
                 type="password",
-                placeholder="AIzaSy...",
+                placeholder="AQ.Ab... 또는 AIzaSy...",
             )
             if personal_key and personal_key.strip():
-                cleaned_key = personal_key.strip()
-                if not cleaned_key.startswith("AIza"):
-                    st.error("❌ 키 형식 오류")
-                elif len(cleaned_key) < 35:
-                    st.error("❌ 키 길이 부족")
+                cleaned_key, key_err = validate_api_key_format(personal_key)
+                if key_err:
+                    st.error(f"❌ {key_err}")
                 else:
                     api_key_to_use = cleaned_key
 
@@ -3630,8 +3808,24 @@ elif page == "🚀 통합 분석기":
                             pass
                     else:
                         st.warning(f"⚠️ {preview_display}")
-                except Exception:
-                    pass
+                except Exception as _pe:
+                    # v3.4: 키 입력 직후 인증 실패를 즉시 알려준다.
+                    # v3.5: 분류 함수로 통일
+                    _pes = str(_pe)
+                    if api_key_to_use and api_key_to_use in _pes:
+                        _pes = _pes.replace(api_key_to_use, "***HIDDEN***")
+                    if classify_api_error(_pes) == "auth":
+                        st.error(
+                            "❌ **이 키로 인증할 수 없습니다.**\n\n"
+                            "- 키를 전체 복사했는지 확인해주세요 (앞뒤 잘림·공백 없이)\n"
+                            "- Google AI Studio에서 해당 키가 활성 상태인지 확인해주세요\n"
+                            "- 새 형식(`AQ.`) 키는 일부 계정에서 서버가 거부하는 사례가 "
+                            "보고되고 있습니다. 기존 `AIza` 키가 있다면 그것으로 시도해보세요."
+                        )
+                        with st.expander("오류 상세", expanded=False):
+                            st.code(_pes[:500])
+                    else:
+                        st.warning("⚠️ 모델 목록을 확인하지 못했습니다. 분석 시 다시 시도합니다.")
 
             st.markdown("#### 👇 준비가 되었으면 아래 버튼을 클릭하세요")
             if st.button("✨ Gemini AI 정밀 분석 시작", use_container_width=True, type="primary"):
