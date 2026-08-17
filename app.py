@@ -1,22 +1,33 @@
 """
-3GPP Contribution Analyzer v2.9 — Memory & Network Optimized
-=============================================================
+3GPP Contribution Analyzer v3.1 — Stance Analysis + Hardened Model Allowlist
+=============================================================================
 Output 1: Conclusions 취합 .docx (원본과 동일)
 Output 2: TF-IDF Proposal Summary .docx (원본과 동일)
-Output 3: Gemini 의미 분석 (선택, 모델 선택 가능)
+Output 3: Gemini 의미 분석 (무료 Flash 계열 전용)
 
-v2.9 변경점 (Cloud Run 1Gi 환경 최적화):
-- 문서별 임시파일 즉시 해제: 처리 끝난 zip/압축폴더를 바로 비워 RAM 피크 대폭 감소
-  (Cloud Run에서 /tmp는 메모리이므로 200개 문서 누적 시 OOM 위험을 제거)
-- HTTP 커넥션 풀링: requests.Session + 풀로 keep-alive 재사용, 다운로드 속도 향상
-- 모델 캐시 키별 딕셔너리 + 10분 TTL: 서버키/개인키 혼용 시 캐시 무력화 문제 해결
-- 무의미한 genai.configure() 2곳 제거 (락 획득/해제 오버헤드만 발생하던 코드)
-- 중복 문서번호 추출 디렉토리 충돌 방지
+v3.1 변경점:
+- 분석 결과를 '이슈 → 입장 → 회사' 3계층으로 재구성.
+  한 쟁점 안에서 찬성/반대/해법별 진영을 나누고 각 진영의 회사 수를 표시.
+  (Direct / Map-Reduce / 심층분석 3개 프롬프트 모두 적용)
+- 모델 선택을 blocklist → allowlist로 전환.
+  v3.0의 blocklist는 gemini-omni-flash(비디오 생성)가 이름에 'flash'가 있어
+  통과하는 구멍이 있었음. 이제 gemini-<ver>-flash[-lite] 형태만 허용해
+  이미지/TTS/오디오/번역/에이전트 모델이 원천 차단됨.
+- 같은 버전이면 Lite보다 일반 Flash 우선하도록 정렬 키 개선.
 
-v2.8 변경점 (유지):
-- 임시파일 자동 정리: 앱 전용 네임스페이스(/tmp/3gpp_analyzer/) + PID/heartbeat 기반.
-  컨텍스트매니저(정상+예외) + atexit + 시작 스윕 3중 안전망.
+v3.0 변경점 (유지):
+- Pro 계열 완전 제거. 2026년 4월 Google이 Pro를 무료 티어에서 제외했기 때문에,
+  Pro를 쓰려면 결제 활성화가 필요하고 그 순간부터 토큰 종량 과금이 발생함.
+  예기치 않은 요금을 원천 차단하기 위해 Pro/Ultra/Preview 등 유료 계열을
+  선택지·자동선택·수동선택·최종 생성 4단계 모두에서 차단.
+- 최신 Flash 자동 선택: gemini-flash-latest 별칭 우선, 없으면 모델명에서
+  버전 숫자를 파싱해 가장 높은 버전 선택 (3.6 > 3.5 > 2.5 ...).
+  하드코딩 목록이 없으므로 4.x가 나와도 코드 수정 없이 자동 대응.
+- 503 폴백을 Pro→Flash에서 Flash→다른 Flash로 변경
 
+v2.9 변경점 (유지): 문서별 임시파일 즉시 해제, HTTP 커넥션 풀링,
+  모델 캐시 키별 TTL, 무의미한 configure 제거
+v2.8 변경점 (유지): 임시파일 자동 정리 (네임스페이스 + PID/heartbeat)
 v2.6 변경점 (유지): cross-audit 후 10개 fix 적용
 - A. 글로벌 락 통합 — 기존 _genai_lock과 _cached_models_lock → 단일 _GLOBAL_GEMINI_LOCK
 B. 스레드 안전 로깅 — 워커 스레드는 timestamp/thread-name 붙여 버퍼링,
@@ -276,76 +287,144 @@ def _safe_gemini_call(api_key, model_obj, prompt, generation_config=None):
 
 
 # ==========================================
-# v2.4 신규: 모델 우선순위 정의
+# v3.0: 무료 티어 전용 — Flash 계열만 사용
 # ==========================================
-# 패턴은 정확 매칭 우선, 그 다음 부분 매칭.
-# Pro는 무료 한도가 빡빡(분당 5회, 일 100회)하므로 명시 선택 시에만 사용.
-# Flash는 분당 10회, 일 250회로 훨씬 여유.
-FLASH_PRIORITY_PATTERNS = [
-    "gemini-2.5-flash",          # 가장 선호 — 최신 Flash, 충분한 성능
-    "gemini-flash-latest",        # alias가 있다면 우선순위 높게
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "flash",                      # 마지막 폴백: flash 들어간 아무거나 (vision/lite 제외)
+# [배경] 2026년 4월 Google이 Pro 모델을 무료 티어에서 제거.
+#        Pro를 쓰려면 결제(billing) 활성화가 필수이며, 그 순간부터
+#        토큰 사용량만큼 실제 요금이 청구됨(종량제).
+#        이 앱은 예기치 않은 과금을 원천 차단하기 위해 Pro를 지원하지 않음.
+#
+# [Flash 자동 선택 전략]
+#   1) gemini-flash-latest — Google 공식 alias. 새 Flash가 나오면 자동 승계.
+#      가장 최신 Flash를 항상 쓰게 해주는 가장 확실한 방법.
+#   2) 버전 번호가 붙은 모델은 아래 _pick_latest_flash()가 숫자를 파싱해
+#      가장 높은 버전을 자동 선택 (3.6 > 3.5 > 3.0 > 2.5 ...).
+#      하드코딩 목록에 의존하지 않으므로 4.x가 나와도 자동 대응.
+_FLASH_LATEST_ALIAS = "gemini-flash-latest"   # Google 공식 최신 Flash 별칭
+
+# ------------------------------------------------------------------
+# [설계 원칙] allowlist(허용목록) 방식
+#
+# v3.0까지는 blocklist("pro/image/tts가 들어가면 제외") 방식이었는데,
+# 실제 모델 목록과 대조해보니 뚫리는 사례가 있었음:
+#   - gemini-omni-flash : 비디오 생성 모델인데 이름에 'flash'가 있고
+#     차단 토큰이 하나도 안 걸려서 후보로 통과됨.
+# Google이 새 이름을 붙일 때마다 blocklist는 계속 뚫리므로,
+# "허용 형태에 정확히 맞는 것만 통과"시키는 allowlist로 전환.
+#
+# 허용 형태(정규식): gemini-<major>[.<minor>]-flash[-lite]
+#   통과: gemini-3.7-flash, gemini-3.6-flash, gemini-3.5-flash-lite,
+#         gemini-2.5-flash, gemini-3-flash
+#   차단: gemini-3.1-flash-image (뒤에 -image),
+#         gemini-3.1-flash-tts-preview, gemini-omni-flash (버전 없음),
+#         gemini-2.5-pro, gemini-3.1-pro-preview,
+#         gemini-2.5-flash-native-audio-preview-12-2025,
+#         gemini-2.5-flash-preview-tts, gemini-3-flash-preview
+#
+# 결과적으로 "텍스트 생성용 stable Flash"만 남음.
+# 새 Flash(4.0 등)가 나와도 이 형태를 따르므로 코드 수정 불필요.
+# ------------------------------------------------------------------
+_FLASH_ALLOW_RE = re.compile(
+    r'^gemini-(\d+)(?:\.(\d+))?-flash(-lite)?$'
+)
+
+# 무료 티어 확인이 안 되는 접미사 — allowlist에 걸리지 않지만 이중 방어용
+_ALWAYS_BLOCK_TOKENS = [
+    "pro", "ultra", "preview", "exp", "thinking",
+    "image", "tts", "audio", "live", "video", "translate", "omni",
+    "vision", "embedding", "imagen", "veo", "lyria", "aqa", "learnlm",
+    "robotics", "computer-use", "deep-research", "antigravity",
 ]
 
-PRO_PRIORITY_PATTERNS = [
-    "gemini-2.5-pro",
-    "gemini-pro-latest",
-    "gemini-1.5-pro",
-    "pro",
-]
 
-# 사용자 표시용 라벨
+# 사용자 표시용 라벨 (Pro 선택지 없음)
 MODEL_DISPLAY_OPTIONS = {
-    "flash_auto": "🟢 Flash 자동 선택 (권장 — 분당 10회, 일 250회)",
-    "pro_auto":   "🟡 Pro 자동 선택 (똑똑함 — 분당 5회, 일 100회, 한도 빨리 소진)",
-    "manual":     "⚙️ 수동 선택 (가용 모델 목록에서 직접 고르기)",
+    "flash_auto": "🟢 최신 Flash 자동 선택 (권장 — 무료 티어)",
+    "manual":     "⚙️ 수동 선택 (무료 Flash 계열 중에서 직접 고르기)",
 }
 
 
-def _pick_model_by_priority(valid_models, patterns, extra_excludes=None):
-    """우선순위 패턴 리스트에 따라 모델 선택. vision/lite/embedding은 자동 제외.
+def _model_short_name(model_name):
+    """'models/gemini-3.7-flash' → 'gemini-3.7-flash' (소문자)."""
+    return (model_name or "").lower().strip().split("/")[-1]
 
-    v2.5 수정:
-    - "flash" 부분 매칭 시 "lite"가 들어간 모델도 제외 (Flash-Lite 방지)
-    - extra_excludes 파라미터로 폴백 시 "pro" 제외 등 추가 필터링 가능
+
+def _is_allowed_flash(model_name):
+    """텍스트 생성용 무료 Flash 모델인지 판정 (allowlist).
+
+    별칭 gemini-flash-latest도 허용.
+    그 외에는 gemini-<ver>-flash[-lite] 형태에 정확히 일치해야 통과.
     """
-    EXCLUDE_TOKENS = ["vision", "embedding", "tts", "image", "audio"]
-    if extra_excludes:
-        EXCLUDE_TOKENS = EXCLUDE_TOKENS + list(extra_excludes)
+    short = _model_short_name(model_name)
+    if not short:
+        return False
+    # 이중 방어: 위험 토큰이 있으면 형태와 무관하게 거부
+    for tok in _ALWAYS_BLOCK_TOKENS:
+        if tok in short:
+            return False
+    if short == _FLASH_LATEST_ALIAS:
+        return True
+    return bool(_FLASH_ALLOW_RE.match(short))
 
-    candidates = [m for m in valid_models
-                  if not any(tok in m.lower() for tok in EXCLUDE_TOKENS)]
 
-    if not candidates:
-        candidates = list(valid_models)
+def _is_blocked_model(model_name):
+    """유료/미지원 모델인지 판정. True면 절대 사용 안 함.
+    allowlist의 여집합 — 즉 '허용되지 않은 모든 것'을 차단."""
+    return not _is_allowed_flash(model_name)
 
-    # 패턴 우선순위로 정확/부분 매칭
-    for pattern in patterns:
-        # 정확 매칭 우선
-        for m in candidates:
-            m_lower = m.lower()
-            m_short = m_lower.split('/')[-1]  # "models/gemini-2.5-flash" → "gemini-2.5-flash"
-            if pattern == m_short:
-                return m
-        # 부분 매칭
-        for m in candidates:
-            m_lower = m.lower()
-            if pattern in m_lower:
-                # v2.5 수정: flash 계열 패턴 매칭 시 lite 무조건 제외
-                # (gemini-2.5-flash 패턴이 gemini-2.5-flash-lite도 잡지 않도록)
-                if "flash" in pattern and "lite" in m_lower:
-                    continue
-                # Pro 검색 시 vision 제외 (기존 로직 유지)
-                if pattern == "pro" and "vision" in m_lower:
-                    continue
-                return m
 
-    # 매칭 0개 → None 반환 (호출자가 명시적으로 폴백 결정)
-    # v2.5 수정: 이전엔 candidates[0]을 무조건 반환했으나, 의도와 다른 모델이
-    # 조용히 잡히는 문제가 있어 None 반환으로 변경. 호출자가 처리.
-    return None
+def _flash_version_key(model_name):
+    """모델명에서 버전을 뽑아 정렬 키 생성. 높을수록 최신.
+
+    'gemini-3.7-flash'      → (3, 7, 1)   ← 일반 Flash
+    'gemini-3.5-flash-lite' → (3, 5, 0)   ← 같은 버전이면 Lite가 후순위
+    'gemini-3-flash'        → (3, 0, 1)
+    형태 불일치            → (-1, -1, -1)
+    """
+    short = _model_short_name(model_name)
+    m = _FLASH_ALLOW_RE.match(short)
+    if not m:
+        return (-1, -1, -1)
+    major = int(m.group(1))
+    minor = int(m.group(2) or 0)
+    is_lite = 1 if m.group(3) else 0
+    # lite면 0, 아니면 1 → 같은 버전에서 일반 Flash가 앞서도록
+    return (major, minor, 1 - is_lite)
+
+
+def _pick_latest_flash(valid_models):
+    """가용 모델 중 '가장 최신 텍스트 Flash'를 자동 선택.
+
+    선택 순서:
+      1) gemini-flash-latest 별칭 (Google이 항상 최신으로 유지)
+      2) 없으면 allowlist를 통과한 모델 중 버전 최고값
+         (같은 버전이면 Lite보다 일반 Flash 우선)
+    """
+    if not valid_models:
+        return None
+
+    allowed = [m for m in valid_models if _is_allowed_flash(m)]
+    if not allowed:
+        return None
+
+    # 1) 공식 최신 별칭이 있으면 그것을 사용
+    for m in allowed:
+        if _model_short_name(m) == _FLASH_LATEST_ALIAS:
+            return m
+
+    # 2) 버전 내림차순 (major, minor, non-lite 우선)
+    allowed.sort(key=_flash_version_key, reverse=True)
+    return allowed[0]
+
+
+def _list_selectable_models(valid_models):
+    """수동 선택 UI에 노출할 목록 (텍스트 생성용 무료 Flash만)."""
+    return [m for m in (valid_models or []) if _is_allowed_flash(m)]
+
+
+# v3.0: _pick_model_by_priority() 제거됨.
+# 하드코딩된 버전 목록에 의존하던 방식 → _pick_latest_flash()의 버전 파싱 방식으로 대체.
+# 새 Flash 버전이 나와도 코드 수정 없이 자동으로 최신을 선택함.
 
 
 # ==========================================
@@ -731,11 +810,10 @@ def _get_cached_models(api_key):
 
 def _resolve_model_for_choice(api_key, choice, manual_name=""):
     """사용자 선택에 따라 실제 모델명 결정.
-    choice: "flash_auto" | "pro_auto" | "manual"
+    choice: "flash_auto" | "manual"
     Returns: (model_name, display_name) or (None, error_msg)
 
-    v2.5 수정: Pro 매칭 실패 시 조용히 Flash 폴백하지 않고 명시적 에러 메시지 반환.
-              사용자가 의식하지 못한 채 Flash로 분석하는 것을 방지.
+    v3.0: Pro 경로 완전 제거. 유료 전용 모델은 수동 선택으로도 통과 불가.
     """
     valid = _get_cached_models(api_key)
     if not valid:
@@ -744,31 +822,30 @@ def _resolve_model_for_choice(api_key, choice, manual_name=""):
     if choice == "manual":
         if not manual_name:
             return None, "수동 모드인데 모델명이 비어있습니다."
-        # 정확 매칭 (사용자 입력 그대로 + models/ prefix 있는 것)
+        # v3.0: 사용자가 어떤 경로로 유료 모델명을 넣더라도 여기서 차단
+        if _is_blocked_model(manual_name):
+            return None, (
+                f"'{manual_name}'은(는) 유료 결제가 필요한 모델이라 사용할 수 없습니다. "
+                "이 앱은 무료 티어 Flash 계열만 지원합니다."
+            )
         for m in valid:
             if m == manual_name or m.endswith(f"/{manual_name}") or m.split("/")[-1] == manual_name:
+                if _is_blocked_model(m):
+                    return None, (
+                        f"'{manual_name}'은(는) 유료 전용 모델입니다. "
+                        "무료 Flash 계열을 선택해주세요."
+                    )
                 return m, m.split("/")[-1]
         return None, f"입력한 모델 '{manual_name}'을 찾지 못했습니다."
 
-    if choice == "pro_auto":
-        # v2.5: Pro 의도이므로 Flash가 잡히지 않도록 추가 안전장치
-        target = _pick_model_by_priority(valid, PRO_PRIORITY_PATTERNS,
-                                          extra_excludes=["flash", "lite"])
-        if not target:
-            # Pro가 아예 없음 → 사용자에게 명시적으로 알림
-            return None, (
-                "Pro 모델을 찾지 못했습니다. 무료 티어에서 Pro가 제거되었거나 "
-                "결제가 활성화되지 않은 키일 수 있습니다. "
-                "Flash 자동 또는 수동 선택으로 변경해주세요."
-            )
-        return target, target.split("/")[-1]
-    else:  # flash_auto (default)
-        # v2.5: Flash 의도이므로 Pro가 잡히지 않도록 추가 안전장치
-        target = _pick_model_by_priority(valid, FLASH_PRIORITY_PATTERNS,
-                                          extra_excludes=["pro"])
-        if not target:
-            return None, "Flash 계열 모델을 찾지 못했습니다. 수동 선택으로 변경해주세요."
-        return target, target.split("/")[-1]
+    # flash_auto (기본이자 유일한 자동 모드) — 가장 최신 Flash 자동 선택
+    target = _pick_latest_flash(valid)
+    if not target:
+        return None, (
+            "사용 가능한 무료 Flash 모델을 찾지 못했습니다. "
+            "API 키가 유효한지 확인해주세요."
+        )
+    return target, target.split("/")[-1]
 
 
 def normalize_company(name):
@@ -1986,24 +2063,30 @@ def _call_with_retry_and_fallback(api_key, model_obj, prompt, generation_config,
             is_429 = "429" in err_str
             is_503 = "503" in err_str or "overloaded" in err_str.lower() or "unavailable" in err_str.lower()
 
-            # v2.4: 503이고 아직 Flash로 폴백 안 했으면 폴백
-            if is_503 and not fallback_attempted and model_choice == "pro_auto":
+            # v3.0: 503(서버 과부하) 시 다른 Flash 버전으로 폴백.
+            # 기존엔 Pro→Flash 폴백이었으나 Pro를 지원하지 않게 되어,
+            # 이제는 현재 Flash가 과부하일 때 사용 가능한 다른 Flash로 옮김.
+            if is_503 and not fallback_attempted:
                 fallback_attempted = True
                 valid_models = _get_cached_models(api_key)
-                # v2.5: Pro 제외하고 Flash 모델만 잡도록 명시
-                flash_target = _pick_model_by_priority(
-                    valid_models, FLASH_PRIORITY_PATTERNS,
-                    extra_excludes=["pro"]
-                )
-                if flash_target and flash_target != cur_name:
+                alt_candidates = [
+                    m for m in _list_selectable_models(valid_models)
+                    if m.split('/')[-1] != cur_name
+                ]
+                if alt_candidates:
+                    # 버전 높은 순으로 정렬해 차선 Flash 선택
+                    alt_candidates.sort(key=lambda m: _flash_version_key(m), reverse=True)
+                    alt_target = alt_candidates[0]
                     if status_elem:
                         try:
-                            status_elem.text(f"⚠️ Pro 서버 과부하 — Flash로 영구 폴백: {flash_target.split('/')[-1]}")
+                            status_elem.text(
+                                f"⚠️ 서버 과부하 — 다른 Flash로 전환: {alt_target.split('/')[-1]}"
+                            )
                         except Exception:
                             pass
-                    append_log(f"503 폴백: {cur_name} → {flash_target}")
-                    cur_model = genai.GenerativeModel(flash_target)
-                    cur_name = flash_target.split('/')[-1]
+                    append_log(f"503 폴백: {cur_name} → {alt_target}")
+                    cur_model = genai.GenerativeModel(alt_target)
+                    cur_name = alt_target.split('/')[-1]
                     time.sleep(3)
                     continue  # 즉시 재시도 (대기 없음)
 
@@ -2082,30 +2165,90 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
 - Nokia = Nokia Shanghai Bell
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[그룹핑 규칙]
+[분석 구조 — 이슈 → 입장 → 회사]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. 두 제안을 같은 그룹으로 묶으려면:
-   a) 같은 기술적 메커니즘을 다루고 있어야 함
-   b) 제안하는 구체적 동작이 동일하거나 매우 유사해야 함
-   c) 같은 주제라도 제안 방향이 다르면 별도 그룹
+이 분석의 목적은 "어떤 쟁점에서 회사들의 의견이 어떻게 갈리는지"를
+한눈에 보여주는 것입니다. 따라서 다음 3계층으로 정리하세요.
 
-2. 뭉뚱그리지 마세요. "에너지 효율 관련" 같은 광범위 그룹 금지.
-3. 1개 회사만 단독 주장한 제안은 제외.
-4. CR 문서의 "Summary of change"도 제안으로 취급.
+[1계층] 이슈(쟁점)
+  - 여러 회사가 공통으로 다루는 하나의 기술적 논점.
+  - 예: "C-DRX 주기와 DL-WUS 모니터링 주기를 동일하게 설정할 것인가"
+  - 뭉뚱그리지 마세요. "에너지 효율 관련" 같은 광범위 이슈 금지.
+  - 2개 이상 회사가 다룬 이슈만 포함.
+
+[2계층] 입장(option)
+  - 하나의 이슈 안에서 회사들이 취하는 서로 다른 견해를 각각 별도로 나눕니다.
+  - 입장은 보통 다음 형태로 나타납니다:
+      · 서로 다른 해법 제시 (예: "독립 설정" vs "공통 값" vs "네트워크 결정")
+      · 어떤 제안에 대한 찬성 / 반대
+      · 조건부 찬성(특정 전제 하에서만 동의)
+  - 각 입장마다 지지 회사를 빠짐없이 나열하고 회사 수를 셉니다.
+  - 한 회사가 한 이슈에서 하나의 입장에만 속하도록 배정하세요.
+    (원문에서 판단이 어려우면 그 회사는 해당 입장에 넣지 마세요.)
+
+[3계층] 근거
+  - 각 입장을 뒷받침하는 문서번호와 원문 문구.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[입장 분류 규칙]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 찬성/반대가 명시적으로 드러나는 경우에만 찬성·반대로 분류합니다.
+   - 찬성 신호: support, agree, we think X is beneficial, propose to adopt 등
+   - 반대 신호: do not support, disagree, object, we see no benefit,
+                should not be introduced, unnecessary 등
+2. 찬반이 아니라 서로 다른 해법을 제시하는 경우에는 찬성/반대 대신
+   각 해법을 별도 입장(Option A / Option B / ...)으로 만드세요.
+3. "네트워크 구현에 맡기자", "추가 논의 필요", "RAN1 결정에 따름" 같은
+   유보적 견해도 하나의 독립된 입장으로 취급하세요.
+4. 원문에 근거가 없는 찬반 추정 금지. 애매하면 그 회사를 넣지 마세요.
+5. 1개 회사만 단독 주장한 입장이라도, 그 이슈 자체를 2개 이상 회사가
+   다루고 있다면 소수 의견으로 표시하세요. (대립 구도 파악에 중요)
+6. CR 문서의 "Summary of change"도 제안으로 취급.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [출력 양식]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-### [순위]. [제안의 구체적 동작을 요약한 제목]
-* **지지 회사 (총 N개사):** 회사명1, 회사명2, ...
-* **상세 내용:** 이 제안이 구체적으로 무엇을 요구하는지 2-3문장.
-* **근거 문서:**
-  - [문서번호] (회사명): 핵심 문구 인용
-  - [문서번호] (회사명): 핵심 문구 인용
+### [순위]. [이슈를 구체적으로 요약한 제목]
+* **논의 참여 (총 N개사):** 회사명1, 회사명2, ...
+* **쟁점 요약:** 이 이슈에서 무엇이 갈리는지 2-3문장.
 
-순위는 지지 회사 수 내림차순.
+* **입장별 분류:**
+
+  **[입장 1] (M개사)** 입장을 한 문장으로 요약
+  - 지지: 회사명1, 회사명2, 회사명3
+  - 근거:
+    - [문서번호] (회사명): 핵심 문구 인용
+    - [문서번호] (회사명): 핵심 문구 인용
+
+  **[입장 2] (K개사)** 입장을 한 문장으로 요약
+  - 지지: 회사명4, 회사명5
+  - 근거:
+    - [문서번호] (회사명): 핵심 문구 인용
+
+  **[입장 3] (1개사, 소수의견)** 입장을 한 문장으로 요약
+  - 지지: 회사명6
+  - 근거:
+    - [문서번호] (회사명): 핵심 문구 인용
+
+찬반 구도가 뚜렷한 이슈는 입장 이름을 "찬성"/"반대"로 쓰세요:
+
+  **[찬성] (M개사)** 무엇에 찬성하는지
+  - 지지: 회사명1, 회사명2
+  - 근거:
+    - [문서번호] (회사명): 핵심 문구 인용
+
+  **[반대] (K개사)** 무엇에 반대하는지, 반대 이유
+  - 지지: 회사명3, 회사명4
+  - 근거:
+    - [문서번호] (회사명): 핵심 문구 인용
+
+[정렬 규칙]
+- 이슈 순위: 논의 참여 회사 수 내림차순.
+- 입장 순위: 각 이슈 안에서 지지 회사 수 내림차순.
+- 회사 수는 반드시 실제 나열한 회사 개수와 일치해야 합니다.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [기고문 원문 데이터]
@@ -2122,8 +2265,20 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
 3. 각 제안마다 문서 번호와 회사명 함께 기록.
 4. 하나의 기고문에 여러 제안이 있으면 각각 별도로.
 
+[입장(stance) 판정 — 2차 통합에서 찬반 진영을 나누는 데 사용됩니다]
+각 제안마다 그 회사가 어떤 태도를 취하는지 반드시 표시하세요.
+- 찬성: support / agree / propose to adopt / beneficial 등이 명시된 경우
+- 반대: do not support / disagree / object / unnecessary /
+        no benefit / should not be introduced 등이 명시된 경우
+- 제안: 찬반이 아니라 자기 해법을 새로 제시하는 경우
+- 유보: 네트워크 구현에 맡기자 / 추가 논의 필요 / 다른 WG 결정에 따름
+원문에 근거가 없으면 "불명확"으로 적고, 임의로 찬반을 추정하지 마세요.
+
 [출력 양식]
+- 쟁점: [이 제안이 다루는 논점을 한 문장으로]
 - 제안: [원문에 가깝게 기술]
+- 입장: [찬성 / 반대 / 제안 / 유보 / 불명확]
+- 대상: [찬성·반대인 경우, 무엇에 대한 찬반인지]
 - 문서: [문서번호]
 - 회사: [회사명]
 - 원문 근거: [원문 인용]
@@ -2136,23 +2291,46 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
 [절대 규칙]
 1. 허용된 문서 번호: {doc_list}
 2. 허용된 회사: {company_list}
-3. 1차 추출 결과에 실제로 있는 내용만 사용.
+3. 1차 추출 결과에 실제로 있는 내용만 사용. 없는 내용 지어내기 금지.
 
-[그룹핑 규칙]
-1. 구체적 동작이 동일한 제안만 같은 그룹.
-2. 같은 주제라도 방향 다르면 별도.
-3. 광범위 그룹 금지.
-4. 2개 이상 회사 지지한 제안만 포함.
-5. CR Summary of change도 포함.
+[통합 구조 — 이슈 → 입장 → 회사]
+1계층 이슈: 여러 회사가 공통으로 다루는 하나의 기술적 논점.
+            광범위 그룹 금지. 2개 이상 회사가 다룬 이슈만 포함.
+2계층 입장: 그 이슈 안에서 갈리는 서로 다른 견해를 각각 분리.
+            1차 추출의 "입장" 필드를 활용해 찬성/반대/해법별로 나눔.
+            유보(네트워크 결정에 맡김 등)도 독립 입장으로 취급.
+            한 회사는 한 이슈에서 하나의 입장에만 배정.
+3계층 근거: 문서번호 + 원문 문구.
+
+[입장 분류 규칙]
+1. 찬반이 명시된 경우에만 찬성/반대로 분류.
+2. 서로 다른 해법 제시면 Option 형태의 별도 입장으로.
+3. 1개 회사 단독 입장이라도 이슈 자체를 2개 이상 회사가 다루면
+   소수의견으로 표시 (대립 구도 파악에 중요).
+4. 회사 수는 실제 나열한 회사 개수와 반드시 일치.
 
 [출력 양식]
-### [순위]. [제안의 구체적 동작 요약]
-* **지지 회사 (총 N개사):** 회사1, 회사2, ...
-* **상세 내용:** 구체적 제안 2-3문장
-* **근거 문서:**
-  - [문서번호] (회사명): 핵심 문구
+### [순위]. [이슈를 구체적으로 요약한 제목]
+* **논의 참여 (총 N개사):** 회사1, 회사2, ...
+* **쟁점 요약:** 무엇이 갈리는지 2-3문장.
 
-내림차순 정렬.
+* **입장별 분류:**
+
+  **[입장 1] (M개사)** 입장 한 문장 요약
+  - 지지: 회사1, 회사2
+  - 근거:
+    - [문서번호] (회사명): 핵심 문구
+
+  **[입장 2] (K개사)** 입장 한 문장 요약
+  - 지지: 회사3
+  - 근거:
+    - [문서번호] (회사명): 핵심 문구
+
+찬반 구도가 뚜렷하면 입장 이름을 "찬성"/"반대"로 사용하세요.
+
+[정렬]
+- 이슈: 논의 참여 회사 수 내림차순
+- 입장: 각 이슈 안에서 지지 회사 수 내림차순
 
 [1차 추출 결과]
 {intermediate_text}"""
@@ -2169,6 +2347,13 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
             return False
 
         model_display = display_or_err
+        # v3.0 최종 방어선: 어떤 경로로도 유료 모델이 여기 도달하면 중단
+        if _is_blocked_model(target):
+            st.error(
+                f"❌ **차단됨:** '{model_display}'은(는) 유료 결제가 필요한 모델입니다.\n\n"
+                f"이 앱은 예기치 않은 과금을 막기 위해 무료 Flash 계열만 사용합니다."
+            )
+            return False
         model = genai.GenerativeModel(target)
         strict_config = {"temperature": 0.0}
 
@@ -2416,10 +2601,13 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key,
     try:
         # v2.9: 진입부 configure 제거 (위와 동일 이유 — 실제 호출 시 재설정됨)
 
-        # v2.4: 사용자 선택 모델 사용 (Flash 강제 아님)
+        # v3.0: 무료 Flash 계열만 사용
         target, display_or_err = _resolve_model_for_choice(api_key, model_choice, manual_model_name)
         if not target:
             return False, f"모델 선택 실패: {display_or_err}"
+        # v3.0 최종 방어선
+        if _is_blocked_model(target):
+            return False, f"'{display_or_err}'은(는) 유료 모델이라 사용할 수 없습니다."
 
         model = genai.GenerativeModel(
             model_name=target,
@@ -2481,12 +2669,27 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key,
 [출력 규칙]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. [근거] 섹션: 오직 위에 제공된 원문 내용만 사용.
-2. [반박] 섹션: **반드시 작성** (절대 생략 불가). "⚠️ 추론" 태그 필수.
-3. [전략적 함의] 섹션: **반드시 작성**.
+2. [진영 구도] 섹션: 원문에 나타난 입장만 사용. 추정 금지.
+3. [반박] 섹션: **반드시 작성** (절대 생략 불가). "⚠️ 추론" 태그 필수.
+4. [전략적 함의] 섹션: **반드시 작성**.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [출력 양식]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+### 🗳️ 진영 구도
+
+원문에서 각 회사가 취한 입장을 분류하세요. 회사 수를 반드시 표시합니다.
+찬반이 아니라 서로 다른 해법이면 Option 형태로 나누세요.
+원문에 입장이 명확하지 않은 회사는 "입장 불명확"에 넣으세요.
+
+- **[찬성 / 입장 A] (N개사):** 회사1, 회사2, ...
+  - 요지: 한 문장
+- **[반대 / 입장 B] (M개사):** 회사3, 회사4, ...
+  - 요지: 한 문장
+- **[유보·조건부] (K개사):** 회사5
+  - 요지: 한 문장
+- **[입장 불명확] (L개사):** 회사6
 
 ### 🧠 주장의 근거 및 논리
 
@@ -2598,7 +2801,7 @@ elif page == "ℹ️ 가이드":
     """)
 
     st.markdown("---")
-    st.header("📊 모델 선택 가이드 (v2.9)")
+    st.header("📊 모델 선택 가이드 (v3.1)")
     st.markdown("""
 **🟢 Flash 자동 (권장):**
 - 분당 10회, 일 250회까지 무료
@@ -2620,9 +2823,9 @@ elif page == "🚀 통합 분석기":
     st.caption("Output 1·2는 기본 | Output 3 Gemini는 선택")
 
     st.caption(
-        "v2.9 — 문서별 임시파일 즉시 정리로 메모리 사용량 감소  \n"
-        "· 다운로드 커넥션 재사용으로 속도 개선  \n"
-        "· 중단·재시작 시 잔여 파일 자동 회수"
+        "v3.1 — 쟁점별로 찬성·반대 회사를 나눠서 표시  \n"
+        "· 최신 Flash 자동 선택 (무료 티어 전용, 요금 청구 없음)  \n"
+        "· 임시파일 자동 정리로 메모리 사용량 감소"
     )
 
     # Step 1: Input
@@ -2804,12 +3007,16 @@ elif page == "🚀 통합 분석기":
             "문서 수에 따라 **약 5~15분** 이상 소요될 수 있습니다."
         )
 
-        # v2.4: 모델 선택 UI
+        # v3.0: 모델 선택 UI — 무료 Flash 계열 전용
         st.markdown("#### 🎯 분석 모델 선택")
+        st.info(
+            "💚 이 앱은 **무료 티어 Flash 계열만** 사용합니다. "
+            "유료 결제가 필요한 Pro 계열은 지원하지 않으므로 토큰 요금이 청구되지 않습니다."
+        )
         model_choice_label = st.radio(
             "모델 선택:",
             list(MODEL_DISPLAY_OPTIONS.values()),
-            index=0,  # Flash 자동이 기본
+            index=0,  # 최신 Flash 자동이 기본
             horizontal=False,
         )
         # 라벨에서 키로 역변환
@@ -2834,6 +3041,7 @@ elif page == "🚀 통합 분석기":
                     st.markdown("**1단계:** [Google AI Studio](https://aistudio.google.com/app/apikey)")
                     st.markdown("**2단계:** **Create API key** → **Create API key in new project** ⚠️ 반드시 in new project!")
                     st.markdown("**3단계:** `AIzaSy...` 키 복사 → 아래 붙여넣기")
+                    st.markdown("💡 **결제(billing)는 등록하지 마세요.** 무료 티어 그대로 쓰면 요금이 발생하지 않습니다.")
 
                 personal_key = st.text_input(
                     "개인 Gemini API Key 입력:",
@@ -2874,21 +3082,25 @@ elif page == "🚀 통합 분석기":
                 else:
                     api_key_to_use = cleaned_key
 
-        # v2.4: 수동 모델 선택 UI (키 입력 후)
+        # v3.0: 수동 모델 선택 UI — 무료 Flash 계열만 노출 (유료 모델 원천 차단)
         if api_key_to_use and model_choice == "manual":
             try:
                 with st.spinner("가용 모델 조회 중..."):
                     valid_models = _get_cached_models(api_key_to_use)
-                if valid_models:
-                    # 표시용으로 짧은 이름 추출
-                    short_names = [m.split("/")[-1] for m in valid_models]
+                selectable = _list_selectable_models(valid_models)
+                # 최신 버전이 위로 오도록 정렬
+                selectable.sort(key=lambda m: _flash_version_key(m), reverse=True)
+                if selectable:
+                    short_names = [m.split("/")[-1] for m in selectable]
                     selected_short = st.selectbox(
-                        "사용할 모델 선택:",
+                        "사용할 모델 선택 (무료 Flash 계열):",
                         short_names,
-                        help="가용 모델 중 직접 선택. 'flash'가 들어간 모델 권장."
+                        help="유료 결제가 필요한 Pro 계열은 목록에서 제외됩니다."
                     )
                     manual_model_name = selected_short
                     st.session_state.ai_manual_model_name = manual_model_name
+                elif valid_models:
+                    st.error("이 키로 사용 가능한 무료 Flash 모델이 없습니다.")
                 else:
                     st.error("가용 모델 목록을 가져오지 못했습니다.")
             except Exception as e:
@@ -2968,7 +3180,7 @@ div.stButton > button[kind="primary"] {
                 if not proposals:
                     st.markdown(st.session_state.ai_summary_text)
                 else:
-                    st.info(f"💡 총 {len(proposals)}개 제안 그룹. **'근거 및 반박 논리 분석'** 버튼을 누르면 심층 분석.")
+                    st.info(f"💡 총 {len(proposals)}개 쟁점. **'근거 및 반박 논리 분석'** 버튼을 누르면 진영별 심층 분석.")
 
                     for p_idx, prop in enumerate(proposals):
                         st.markdown(prop["full_block"])
