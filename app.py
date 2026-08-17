@@ -1,9 +1,38 @@
 """
-3GPP Contribution Analyzer v3.1 — Stance Analysis + Hardened Model Allowlist
-=============================================================================
+3GPP Contribution Analyzer v3.3 — Hardened Input, Size & Time Guards
+=====================================================================
 Output 1: Conclusions 취합 .docx (원본과 동일)
 Output 2: TF-IDF Proposal Summary .docx (원본과 동일)
 Output 3: Gemini 의미 분석 (무료 Flash 계열 전용)
+
+v3.3 변경점:
+- 문서번호 인식이 자릿수를 가정하지 않도록 재작성. 기존 '정확히 7자리' 패턴은
+  R3-262156(6자리), RP-240123 등을 놓쳐 심층분석이 문서를 못 찾고
+  할루시네이션 검증도 무력화돼 있었음. 3~10자리 + 접두어 1~3글자를 수용하고,
+  실제 다운로드 목록과 교차검증해 오탐을 거른다.
+  (\b 대신 lookaround 사용 — 한글 조사가 붙은 "R3-262156에서"도 인식)
+- 다운로드 도메인을 3gpp.org로 제한. Excel 하이퍼링크/직접입력/다운로드 진입부
+  3중 검사 + 외부 리다이렉트 차단.
+- SSL 인증서 검증을 기본 ON으로 전환. SSLError일 때만 해당 요청 1회 완화 + 로그.
+- 파일당 20MB / 실행당 300MB 다운로드 상한, 스트리밍 저장(메모리 2배 사용 제거).
+- 압축 해제 100MB / 압축률 200:1 상한 (zip 폭탄 방어).
+- 분석 시간 예산(기본 20분, 사이드바 조정) + 연속 2배치 실패 시 조기 중단.
+  중단 시에도 수집된 배치로 결과를 만들고, 누락 사실을 화면·문서에 명시.
+- 로그 상한(20만 자 / 워커 2000줄)으로 세션 메모리 누적 방지.
+- Excel 하이퍼링크 없는 행을 RAN1 122차로 찍던 동작 제거 → 제외 후 사유 안내.
+- 모델 캐시 키를 해시로 저장(평문 API 키 미보관), 비POSIX PID 판정 보정,
+  추출 경로를 한 곳에서만 계산해 정리 누락 위험 제거.
+
+v3.2 변경점:
+- 별칭(gemini-flash-latest) 우선 정책 폐기 → 명시적 최신 stable 버전 직접 선택.
+  이유: (1) Google API가 별칭의 실제 해석 모델을 알려주지 않아 화면에
+  표시가 불가능, (2) 별칭이 preview 릴리스를 가리킨 이력이 있어 과금 위험,
+  (3) Google 공식 문서가 프로덕션에선 명시적 모델명 사용을 권고.
+  별칭은 명시적 버전이 하나도 없을 때만 최후 폴백으로 사용.
+- 선택된 실제 모델명을 화면에 표시 (예: gemini-3.7-flash).
+- 모델 선택 근거 확인용 후보 목록 expander 추가.
+- 심층 분석 결과 하단에 사용 모델명 표기.
+- status 문구가 마크다운을 렌더링하도록 수정 (** 기호가 그대로 보이던 문제).
 
 v3.1 변경점:
 - 분석 결과를 '이슈 → 입장 → 회사' 3계층으로 재구성.
@@ -60,6 +89,8 @@ import threading
 import shutil
 import glob
 import atexit
+import urllib.parse
+import hashlib
 from contextlib import contextmanager
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,6 +112,104 @@ except Exception:
 
 _RE_NONWORD = re.compile(r"[^\w\s\-]")
 _RE_SPACES = re.compile(r"\s+")
+
+# ==========================================
+# ★ v3.3: 문서번호 추출 — 자릿수를 가정하지 않음 ★
+# ==========================================
+# [배경] v3.2까지 r'[A-Z]\d?-\d{7}' 을 썼는데 '정확히 7자리'만 잡았음.
+#        실제 3GPP 번호는 자릿수가 다양함:
+#          R3-262156 (6자리, 사용자 실제 파일), C4-241234, RP-240123,
+#          R1-2401234 (7자리), R1-24012345 (8자리), 구형 R1-1234 등
+#        7자리만 잡은 결과 (1) 심층분석이 문서를 못 찾아 기능이 죽고,
+#        (2) 할루시네이션 검증이 항상 통과해 무력화됐음.
+#
+# [설계] 넓게 잡고, 실제 다운로드 목록(valid_doc_ids)과 교차검증해 거른다.
+#        - 접두어 1~3글자 + 선택적 숫자 (R1, R3, RP, SP, CP, GP, S2, C4...)
+#        - 숫자부 3~10자리 (구형 짧은 번호 ~ 미래 긴 번호 모두 수용)
+#        - 오탐이 늘어도 교차검증이 제거하므로 안전.
+#          반대로 좁게 잡으면 진짜 문서를 놓쳐 기능이 죽음.
+#
+# [함정] \b 를 쓰면 안 됨. 한글은 \w 로 취급되어
+#        "R3-262156에서" 처럼 조사가 붙으면 뒤쪽 \b 경계가 깨짐.
+#        AI 출력이 한국어이므로 이 조합이 계속 나옴.
+#        → 명시적 lookaround 사용.
+_DOC_ID_RE = re.compile(
+    r'(?<![A-Za-z0-9])'          # 앞: 영숫자가 아니어야 함
+    r'([A-Z]{1,3}\d?-\d{3,10})'  # 접두어 + 숫자부 (자릿수 유연)
+    r'(?![0-9])'                 # 뒤: 숫자가 이어지면 안 됨 (한글/구두점은 허용)
+)
+
+
+def extract_doc_ids(text):
+    """텍스트에서 3GPP 문서번호 후보를 추출.
+    넓게 잡고, 호출부에서 valid_doc_ids와 교차검증해 오탐을 제거한다."""
+    if not text:
+        return set()
+    try:
+        return set(_DOC_ID_RE.findall(text))
+    except Exception:
+        return set()
+
+
+# ==========================================
+# ★ v3.3: 다운로드 도메인 화이트리스트 ★
+# ==========================================
+# 3gpp.org 및 하위 도메인 외에는 어떤 URL도 다운로드하지 않음.
+# Excel 하이퍼링크/직접입력 링크로 임의 URL이 들어와 내부망에 접근하는
+# SSRF를 원천 차단. 정상 사용(3GPP 공식 서버)에는 영향 없음.
+_ALLOWED_DOC_HOST_EXACT = "3gpp.org"
+_ALLOWED_DOC_HOST_SUFFIX = ".3gpp.org"
+
+
+def _is_allowed_doc_url(url):
+    """3gpp.org 및 그 하위 도메인만 허용. 그 외 전부 차단."""
+    try:
+        p = urllib.parse.urlparse((url or "").strip())
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").lower()
+    if not host:
+        return False
+    return host == _ALLOWED_DOC_HOST_EXACT or host.endswith(_ALLOWED_DOC_HOST_SUFFIX)
+
+
+# ==========================================
+# ★ v3.3: 크기 / 시간 상한 (Cloud Run 1Gi 보호) ★
+# ==========================================
+# Cloud Run에서 /tmp 는 메모리(tmpfs)이므로, 크기 제한이 없으면
+# 대형 파일 하나 또는 zip 폭탄으로 인스턴스가 OOM으로 죽음.
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024     # 파일당 20MB
+MAX_TOTAL_DOWNLOAD_BYTES = 300 * 1024 * 1024   # 실행당 누적 300MB
+MAX_EXTRACT_BYTES = 100 * 1024 * 1024     # 압축 해제 결과 100MB (zip 폭탄 방어)
+MAX_COMPRESSION_RATIO = 200               # 압축률 상한 (헤더 위조 대비)
+
+# 분석 시간 예산 기본값 (사이드바에서 5~50분 조정 가능)
+DEFAULT_TIME_BUDGET_MIN = 20
+
+# 로그 상한 (세션 메모리 보호)
+_MAX_LOG_CHARS = 200_000
+_MAX_BUFFER_LINES = 2_000
+
+# 실행당 누적 다운로드 추적 (스레드 안전)
+_download_bytes_total = 0
+_download_bytes_lock = threading.Lock()
+
+
+def _reset_download_budget():
+    global _download_bytes_total
+    with _download_bytes_lock:
+        _download_bytes_total = 0
+
+
+def _add_download_bytes(n):
+    """누적 다운로드량 증가. 상한 초과 시 False 반환."""
+    global _download_bytes_total
+    with _download_bytes_lock:
+        _download_bytes_total += n
+        return _download_bytes_total <= MAX_TOTAL_DOWNLOAD_BYTES
+
 
 # ==========================================
 # ★ v2.9: HTTP 커넥션 풀링 ★
@@ -110,20 +239,44 @@ def _get_http_session():
     return _http_session
 
 
-def _http_get(url, **kwargs):
-    """세션 기반 GET. 실패 시 표준 requests.get으로 폴백."""
+def _http_request(method, url, **kwargs):
+    """세션 기반 HTTP 요청.
+
+    v3.3 변경:
+    - SSL 인증서 검증을 기본 ON. (v3.2까지는 전부 verify=False로 우회했음)
+      SSLError가 발생한 요청에 한해서만 1회 검증을 완화하고 로그에 남긴다.
+      도메인이 3gpp.org로 고정되어 있어 완화 대상이 한정적.
+    - 호출자가 verify를 명시하면 그대로 존중 (내부 호환용).
+    """
+    explicit_verify = kwargs.pop("verify", None)
+    sess = None
     try:
-        return _get_http_session().get(url, **kwargs)
+        sess = _get_http_session()
     except Exception:
-        return requests.get(url, **kwargs)
+        sess = None
+
+    def _do(verify_flag):
+        if sess is not None:
+            return getattr(sess, method)(url, verify=verify_flag, **kwargs)
+        return getattr(requests, method)(url, verify=verify_flag, **kwargs)
+
+    if explicit_verify is not None:
+        return _do(explicit_verify)
+
+    try:
+        return _do(True)
+    except requests.exceptions.SSLError:
+        # 인증서 문제인 경우에만 완화 재시도 (그 외 예외는 그대로 전파)
+        append_log(f"⚠️ SSL 인증서 검증 실패 → 이 요청만 검증 완화: {str(url)[:70]}")
+        return _do(False)
+
+
+def _http_get(url, **kwargs):
+    return _http_request("get", url, **kwargs)
 
 
 def _http_head(url, **kwargs):
-    """세션 기반 HEAD. 실패 시 표준 requests.head로 폴백."""
-    try:
-        return _get_http_session().head(url, **kwargs)
-    except Exception:
-        return requests.head(url, **kwargs)
+    return _http_request("head", url, **kwargs)
 
 
 # ==========================================
@@ -152,6 +305,11 @@ def _ensure_tmp_root():
 def _pid_alive(pid):
     if pid <= 0:
         return False
+    # v3.3: os.kill(pid, 0)은 POSIX 규약. 비POSIX(Windows 로컬 개발 등)에서는
+    # 동작이 달라 오판할 수 있으므로, PID 검사를 건너뛰고 살아있다고 간주한다.
+    # (그 경우 heartbeat 시간만으로 stale 판정 → 안전 측 동작)
+    if os.name != "posix":
+        return True
     try:
         os.kill(pid, 0)
         return True
@@ -300,7 +458,30 @@ def _safe_gemini_call(api_key, model_obj, prompt, generation_config=None):
 #   2) 버전 번호가 붙은 모델은 아래 _pick_latest_flash()가 숫자를 파싱해
 #      가장 높은 버전을 자동 선택 (3.6 > 3.5 > 3.0 > 2.5 ...).
 #      하드코딩 목록에 의존하지 않으므로 4.x가 나와도 자동 대응.
-_FLASH_LATEST_ALIAS = "gemini-flash-latest"   # Google 공식 최신 Flash 별칭
+_FLASH_LATEST_ALIAS = "gemini-flash-latest"   # Google 공식 최신 Flash 별칭 (폴백용)
+
+# ------------------------------------------------------------------
+# [v3.2 정책 변경] 별칭(gemini-flash-latest)을 더 이상 1순위로 쓰지 않음.
+#
+# 이유 1 — 어떤 모델인지 알 수 없음:
+#   Google API는 별칭이 실제로 어느 모델로 해석되는지 알려주는 필드를
+#   제공하지 않음. 응답 메타데이터(model_version)도 "gemini-flash-latest"만
+#   그대로 돌려줌. 따라서 화면에 실제 모델명을 표시할 방법이 없음.
+#
+# 이유 2 — 과금 위험:
+#   별칭은 stable뿐 아니라 preview/experimental 릴리스도 가리킬 수 있음.
+#   실제로 2026-01 changelog 기준 gemini-flash-latest가
+#   gemini-3-flash-preview(프리뷰)로 전환된 이력이 있음.
+#   프리뷰는 billing 활성화를 요구하는 경우가 있어 이 앱의 "무료 전용"
+#   원칙과 충돌.
+#
+# 이유 3 — Google 공식 권고:
+#   프로덕션 앱은 -latest 별칭 대신 최신 stable의 명시적 모델명을 쓸 것을
+#   Google이 문서에서 권고함 (별칭은 hot-swap되어 동작이 바뀔 수 있음).
+#
+# → 그래서 v3.2는 gemini-<ver>-flash 중 버전이 가장 높은 것을 직접 선택.
+#   별칭은 "명시적 버전이 하나도 없을 때"만 최후 폴백으로 사용.
+# ------------------------------------------------------------------
 
 # ------------------------------------------------------------------
 # [설계 원칙] allowlist(허용목록) 방식
@@ -395,10 +576,11 @@ def _flash_version_key(model_name):
 def _pick_latest_flash(valid_models):
     """가용 모델 중 '가장 최신 텍스트 Flash'를 자동 선택.
 
-    선택 순서:
-      1) gemini-flash-latest 별칭 (Google이 항상 최신으로 유지)
-      2) 없으면 allowlist를 통과한 모델 중 버전 최고값
+    v3.2 선택 순서 (별칭 우선 정책 폐기):
+      1) gemini-<ver>-flash[-lite] 형태 중 버전 최고값
          (같은 버전이면 Lite보다 일반 Flash 우선)
+         → 실제 모델명을 알 수 있고, stable만 통과하므로 과금 위험 없음
+      2) 명시적 버전 모델이 하나도 없을 때만 gemini-flash-latest 별칭 폴백
     """
     if not valid_models:
         return None
@@ -407,19 +589,34 @@ def _pick_latest_flash(valid_models):
     if not allowed:
         return None
 
-    # 1) 공식 최신 별칭이 있으면 그것을 사용
+    # 1) 명시적 버전이 있는 모델 우선 (정렬키 major >= 0)
+    versioned = [m for m in allowed if _flash_version_key(m)[0] >= 0]
+    if versioned:
+        versioned.sort(key=_flash_version_key, reverse=True)
+        return versioned[0]
+
+    # 2) 최후 폴백: 별칭 (실제 모델명을 알 수 없으므로 최후 수단)
     for m in allowed:
         if _model_short_name(m) == _FLASH_LATEST_ALIAS:
             return m
-
-    # 2) 버전 내림차순 (major, minor, non-lite 우선)
-    allowed.sort(key=_flash_version_key, reverse=True)
-    return allowed[0]
+    return None
 
 
 def _list_selectable_models(valid_models):
     """수동 선택 UI에 노출할 목록 (텍스트 생성용 무료 Flash만)."""
     return [m for m in (valid_models or []) if _is_allowed_flash(m)]
+
+
+def _model_label(model_name):
+    """화면 표시용 모델 라벨.
+
+    별칭(gemini-flash-latest)이 선택된 경우, Google API가 실제 해석 모델을
+    알려주지 않으므로 그 사실을 사용자에게 명시한다.
+    """
+    short = _model_short_name(model_name)
+    if short == _FLASH_LATEST_ALIAS:
+        return f"{short} (별칭 — 실제 버전 확인 불가)"
+    return short
 
 
 # v3.0: _pick_model_by_priority() 제거됨.
@@ -494,6 +691,8 @@ DEFAULTS = {
     # v2.4 신규
     "ai_model_choice": "flash_auto",
     "ai_call_interval": 8,
+    # v3.3: 분석 시간 예산 (분). Cloud Run 타임아웃보다 짧게 잡아야 함.
+    "ai_time_budget_min": DEFAULT_TIME_BUDGET_MIN,
     "ai_manual_model_name": "",
     # v2.6 Fix E: PDF skip 카운터 (extraction 후 배너 표시용)
     "pdf_skip_count": 0,
@@ -534,8 +733,21 @@ def _flush_thread_log_buffer():
         _thread_log_buffer.clear()
     try:
         st.session_state.log_text += batch
+        _trim_log()
     except Exception:
         # session_state 접근 실패 시(예: 스크립트 컨텍스트 없음) 무시
+        pass
+
+
+def _trim_log():
+    """v3.3: 로그 무한 증가 방지. 오래된 앞부분을 잘라 상한 유지."""
+    try:
+        cur = st.session_state.log_text
+        if len(cur) > _MAX_LOG_CHARS:
+            st.session_state.log_text = (
+                "...(이전 로그 생략)...\n" + cur[-_MAX_LOG_CHARS:]
+            )
+    except Exception:
         pass
 
 
@@ -543,12 +755,14 @@ def append_log(text):
     """스레드 인식 로그.
     - 메인 스레드: 직접 session_state에 쓰고, 동시에 워커 버퍼도 flush
     - 워커 스레드: timestamp + 스레드명 prefix 붙여 버퍼링
+    v3.3: 양쪽 모두 상한을 둬서 세션 메모리 무한 증가를 막음.
     """
     if threading.current_thread() is threading.main_thread():
         # 메인 스레드: 워커 버퍼 먼저 비우고 자기 메시지 추가
         _flush_thread_log_buffer()
         try:
             st.session_state.log_text += f"{text}\n"
+            _trim_log()
         except Exception:
             pass
     else:
@@ -556,6 +770,10 @@ def append_log(text):
         ts = datetime.now().strftime("%H:%M:%S")
         tname = threading.current_thread().name
         with _thread_log_buffer_lock:
+            # v3.3: 메인 스레드가 오래 flush하지 않아도 무한히 커지지 않도록 상한
+            if len(_thread_log_buffer) >= _MAX_BUFFER_LINES:
+                del _thread_log_buffer[:len(_thread_log_buffer) // 2]
+                _thread_log_buffer.append("...(워커 로그 일부 생략)...")
             _thread_log_buffer.append(f"[{ts}] [{tname}] {text}")
 
 
@@ -785,12 +1003,22 @@ _MODEL_CACHE_TTL = 600     # 10분
 _MODEL_CACHE_MAX = 8       # 키 개수 상한 (메모리 보호)
 
 
+def _cache_key_for(api_key):
+    """v3.3: API 키 원문을 딕셔너리 키로 남기지 않도록 해시로 변환."""
+    try:
+        return hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return "invalid"
+
+
 def _get_cached_models(api_key):
     """모델 목록만 캐싱. 어떤 모델을 쓸지는 매번 재선택.
-    v2.9: 키별 캐시 + TTL. 빈 리스트는 캐시하지 않음."""
+    v2.9: 키별 캐시 + TTL. 빈 리스트는 캐시하지 않음.
+    v3.3: 캐시 키를 해시로 저장 (평문 API 키 노출 방지)."""
+    ck = _cache_key_for(api_key)
     with _GLOBAL_GEMINI_LOCK:
         now = time.time()
-        cached = _model_cache.get(api_key)
+        cached = _model_cache.get(ck)
         if cached and (now - cached[1]) < _MODEL_CACHE_TTL:
             return cached[0]
         genai.configure(api_key=api_key)
@@ -804,7 +1032,7 @@ def _get_cached_models(api_key):
                     _model_cache.pop(oldest, None)
                 except Exception:
                     _model_cache.clear()
-            _model_cache[api_key] = (valid_models, now)
+            _model_cache[ck] = (valid_models, now)
         return valid_models
 
 
@@ -835,7 +1063,7 @@ def _resolve_model_for_choice(api_key, choice, manual_name=""):
                         f"'{manual_name}'은(는) 유료 전용 모델입니다. "
                         "무료 Flash 계열을 선택해주세요."
                     )
-                return m, m.split("/")[-1]
+                return m, _model_label(m)
         return None, f"입력한 모델 '{manual_name}'을 찾지 못했습니다."
 
     # flash_auto (기본이자 유일한 자동 모드) — 가장 최신 Flash 자동 선택
@@ -845,7 +1073,7 @@ def _resolve_model_for_choice(api_key, choice, manual_name=""):
             "사용 가능한 무료 Flash 모델을 찾지 못했습니다. "
             "API 키가 유효한지 확인해주세요."
         )
-    return target, target.split("/")[-1]
+    return target, _model_label(target)
 
 
 def normalize_company(name):
@@ -877,11 +1105,21 @@ def _safe_filename(text, max_len=40):
 # 유틸리티 함수들
 # ==========================================
 def read_excel_from_bytes(uploaded_file):
-    """v2.6 Fix C: try/finally로 wb.close() 보장 (반복 업로드 시 메모리 누수 방지)."""
+    """Excel에서 문서 목록 추출.
+
+    v2.6 Fix C: try/finally로 wb.close() 보장 (반복 업로드 시 메모리 누수 방지).
+    v3.3:
+      - 하이퍼링크 도메인 검증 (3gpp.org 외 차단)
+      - 하이퍼링크 없을 때 RAN1 122차로 고정 조립하던 것 제거.
+        (RAN3 문서를 올리면 전부 404가 나던 문제)
+        대신 문서번호 접두어로 WG를 추론하고, 추론 불가 시 그 행은 제외.
+    Returns: (entries, skipped) — skipped는 [(docid, 사유), ...]
+    """
     wb = load_workbook(uploaded_file, read_only=False, data_only=True)
     try:
         ws = wb.active
         entries = []
+        skipped = []
         for row in ws.iter_rows(min_row=2):
             cell = row[0]
             comp = row[2] if len(row) > 2 else None
@@ -889,12 +1127,25 @@ def read_excel_from_bytes(uploaded_file):
             company = normalize_company(str(comp.value).strip()) if comp and comp.value else ""
             if not docid:
                 continue
+
+            link = None
             if getattr(cell, "hyperlink", None) and cell.hyperlink.target:
-                link = cell.hyperlink.target
-            else:
-                link = f"https://www.3gpp.org/ftp/tsg_ran/WG1_RL1/TSGR1_122/Docs/{docid}.zip"
+                candidate = str(cell.hyperlink.target).strip()
+                if _is_allowed_doc_url(candidate):
+                    link = candidate
+                else:
+                    skipped.append((docid, "허용되지 않은 도메인 링크"))
+                    continue
+
+            if not link:
+                # v3.3: 하이퍼링크가 없으면 이 앱은 경로를 확정할 수 없음.
+                # 예전처럼 RAN1 122차로 찍으면 다른 WG 문서가 전부 실패하므로,
+                # 링크 없는 행은 명시적으로 제외하고 사용자에게 알린다.
+                skipped.append((docid, "하이퍼링크 없음 (회의 번호 조회 방식 이용 권장)"))
+                continue
+
             entries.append({"doc": docid, "company": company, "link": link})
-        return entries
+        return entries, skipped
     finally:
         try:
             wb.close()
@@ -940,7 +1191,8 @@ WG_TDOC_PREFIX = {
 
 
 def _request_with_retry(url, method="get", max_retries=3, timeout=60, **kwargs):
-    kwargs.setdefault("verify", False)
+    # v3.3: verify를 강제하지 않음 → _http_request가 검증 ON으로 시도 후
+    #       SSLError일 때만 완화 폴백
     kwargs.setdefault("headers", {"User-Agent": "Mozilla/5.0"})
     kwargs["timeout"] = timeout
 
@@ -976,7 +1228,7 @@ def list_meetings_from_ftp(wg):
         return []
     url = f"https://www.3gpp.org/ftp/{ftp_path}/"
     try:
-        r = _http_get(url, timeout=15, verify=False)
+        r = _http_get(url, timeout=15)
         r.raise_for_status()
         all_links = re.findall(r'href="([^"]*)"', r.text)
         prefixes = WG_MEETING_PREFIXES.get(wg, [])
@@ -1290,8 +1542,35 @@ def _safe_extractall(zf, target_dir):
     - symlink resolution 정확
     - Unicode normalization 정확
     - Windows 드라이브 차이 정확
+
+    v3.3 추가: 압축 폭탄(zip bomb) 방어.
+    Cloud Run에서 /tmp가 RAM이므로, 작은 zip이 거대하게 풀리면
+    인스턴스가 OOM으로 죽음. 해제 후 총 크기와 압축률을 사전 검사.
     """
     target_real = os.path.realpath(target_dir)
+
+    # v3.3: 압축 해제 총 크기 / 압축률 사전 검사 (헤더만 읽으므로 비용 거의 없음)
+    try:
+        infos = zf.infolist()
+        total_uncompressed = sum(getattr(i, "file_size", 0) or 0 for i in infos)
+        total_compressed = sum(getattr(i, "compress_size", 0) or 0 for i in infos)
+        if total_uncompressed > MAX_EXTRACT_BYTES:
+            raise ValueError(
+                f"압축 해제 크기 초과 ({total_uncompressed / 1048576:.0f}MB > "
+                f"{MAX_EXTRACT_BYTES // 1048576}MB)"
+            )
+        if total_compressed > 0:
+            ratio = total_uncompressed / total_compressed
+            if ratio > MAX_COMPRESSION_RATIO:
+                raise ValueError(
+                    f"비정상 압축률 감지 ({ratio:.0f}:1) — 압축 폭탄 가능성"
+                )
+    except ValueError:
+        raise
+    except Exception:
+        # infolist 읽기 실패는 아래 경로 검사에서 다시 걸림
+        pass
+
     for member in zf.namelist():
         if not member or os.path.isabs(member):
             raise ValueError(f"ZipSlip vulnerability detected (absolute path): {member}")
@@ -1343,23 +1622,115 @@ def repackage_docm_to_docx(path, td):
 
 
 def _download_doc(entry, td_name, headers, max_retries=3):
+    """문서 zip 다운로드.
+
+    v3.3 추가 방어:
+    1) 도메인 화이트리스트 — 3gpp.org 외에는 요청 자체를 안 함 (최종 방어선)
+    2) 외부 리다이렉트 차단 — 3gpp.org 밖으로 나가는 리다이렉트는 거부
+    3) 파일당 크기 상한 (MAX_DOWNLOAD_BYTES) — Content-Length 선검사 +
+       스트리밍 중 실시간 검사 (Content-Length 없는 서버 대비)
+    4) 실행당 누적 상한 (MAX_TOTAL_DOWNLOAD_BYTES)
+    5) stream=True — r.content로 전체를 메모리에 올리지 않음.
+       Cloud Run에서 /tmp가 RAM이므로 메모리 2배 사용을 피하는 효과.
+    """
+    url = entry.get("link", "")
+
+    # (1) 최종 방어선: 허용 도메인이 아니면 요청조차 하지 않음
+    if not _is_allowed_doc_url(url):
+        return entry, None, "허용되지 않은 도메인 (3gpp.org만 허용)"
+
     last_error = None
     for attempt in range(max_retries):
+        fp = None
         try:
-            kwargs = {"headers": headers, "timeout": 60, "verify": False}
-            r = _http_get(entry["link"], **kwargs)
+            cur_url = url
+            r = None
+            # (2) 리다이렉트를 수동 추적하며 도메인 이탈 차단 (최대 5회)
+            for _ in range(5):
+                r = _http_get(cur_url, headers=headers, timeout=60,
+                              stream=True, allow_redirects=False)
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("Location", "")
+                    nxt = urllib.parse.urljoin(cur_url, loc)
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    if not _is_allowed_doc_url(nxt):
+                        return entry, None, "허용되지 않은 도메인으로 리다이렉트"
+                    cur_url = nxt
+                    continue
+                break
+            if r is None:
+                raise requests.exceptions.ConnectionError("no response")
             r.raise_for_status()
+
+            # (3) Content-Length 선검사
+            try:
+                clen = int(r.headers.get("Content-Length") or 0)
+            except Exception:
+                clen = 0
+            if clen and clen > MAX_DOWNLOAD_BYTES:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                return entry, None, (
+                    f"파일이 너무 큼 ({clen / 1048576:.1f}MB > "
+                    f"{MAX_DOWNLOAD_BYTES // 1048576}MB 제한)"
+                )
+
+            # (5) 스트리밍 저장 + 실시간 크기 검사
             fp = os.path.join(td_name, f"{entry['doc']}.zip")
+            written = 0
             with open(fp, "wb") as f:
-                f.write(r.content)
+                for chunk in r.iter_content(chunk_size=1 << 16):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > MAX_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"다운로드 중 크기 초과 "
+                            f"({MAX_DOWNLOAD_BYTES // 1048576}MB 제한)"
+                        )
+                    f.write(chunk)
+            try:
+                r.close()
+            except Exception:
+                pass
+
+            # (4) 실행당 누적 상한
+            if not _add_download_bytes(written):
+                _safe_unlink(fp)
+                return entry, None, (
+                    f"실행당 누적 다운로드 상한 초과 "
+                    f"({MAX_TOTAL_DOWNLOAD_BYTES // 1048576}MB)"
+                )
+
             return entry, fp, None
+
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as ex:
+            _safe_unlink(fp)
             last_error = str(ex)
             if attempt < max_retries - 1:
                 time.sleep(2 * (attempt + 1))
+        except ValueError as ex:
+            # 크기 초과 등 — 재시도해도 같으므로 즉시 종료
+            _safe_unlink(fp)
+            return entry, None, str(ex)
         except Exception as ex:
+            _safe_unlink(fp)
             return entry, None, str(ex)
     return entry, None, last_error or "Download failed after retries"
+
+
+def _safe_unlink(path):
+    """부분 다운로드 파일 등을 조용히 삭제."""
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 
 def _release_doc_workspace(zip_path, extract_dir):
@@ -1497,6 +1868,7 @@ def _extract_via_cloud(entries, status_elem, progress_elem, log_func):
 def _extract_local(entries, status_elem, progress_elem, log_func):
     with _managed_run_dir() as temp_dir:
         log_func("임시 작업 디렉터리 생성 (자동 정리)")
+        _reset_download_budget()   # v3.3: 실행마다 누적 다운로드 예산 초기화
         od = Document()
         od.add_heading("3GPP Conclusions", level=0)
 
@@ -1541,11 +1913,15 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
             _safe_set_cell_text(tbl.cell(2, 1), e["company"])
             _safe_set_cell_text(tbl.cell(3, 0), "Title")
 
+            # v3.3: 추출 경로를 한 곳에서만 계산해 finally와 공유.
+            # (v3.2까지는 try 안과 finally에서 각각 조립해, 한쪽만 바꾸면
+            #  정리가 조용히 실패하는 구조였음)
+            # v2.9: idx를 붙여 동일 문서번호 중복 시 서로 덮어쓰지 않도록
+            ed = os.path.join(temp_dir, f"{e['doc']}__{idx}")
+
             try:
                 if err or not fp:
                     raise Exception(err or "Download failed")
-                # v2.9: idx를 붙여 동일 문서번호 중복 시 서로 덮어쓰지 않도록
-                ed = os.path.join(temp_dir, f"{e['doc']}__{idx}")
                 os.makedirs(ed, exist_ok=True)
                 with zipfile.ZipFile(fp) as zf:
                     # v2.6 Fix F: ZipSlip 방어
@@ -1879,7 +2255,7 @@ def _extract_local(entries, status_elem, progress_elem, log_func):
             finally:
                 # v2.9: 이 문서의 zip/압축폴더를 즉시 해제 (RAM 피크 감소).
                 # continue로 빠져나가는 경로에서도 finally는 반드시 실행됨.
-                _release_doc_workspace(fp, os.path.join(temp_dir, f"{e['doc']}__{idx}"))
+                _release_doc_workspace(fp, ed)
 
             if idx < len(download_results):
                 try:
@@ -2357,7 +2733,12 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
         model = genai.GenerativeModel(target)
         strict_config = {"temperature": 0.0}
 
-        status_elem.text(f"🧠 모델: **{model_display}** — 분석을 시작합니다...")
+        # v3.2: status_elem.text()는 마크다운을 렌더링하지 않아 **가 그대로
+        # 보이므로 markdown()으로 표시. 실제 선택된 모델명을 그대로 노출.
+        try:
+            status_elem.markdown(f"🧠 **선택된 모델: `{model_display}`** — 분석을 시작합니다...")
+        except Exception:
+            status_elem.text(f"🧠 선택된 모델: {model_display} — 분석을 시작합니다...")
         append_log(f"선택된 모델: {target}")
 
         total_docs = len(extracted_data)
@@ -2374,7 +2755,41 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
             batch_size = DIRECT_THRESHOLD
             total_batches = (total_docs + batch_size - 1) // batch_size
             intermediate = []
+            # v3.3: 부분 실패 추적 + 시간 예산 + 조기 중단
+            failed_batches = []
+            consecutive_failures = 0
+            budget_exceeded = False
+            early_stop_reason = ""
+            try:
+                _budget_sec = int(st.session_state.get(
+                    "ai_time_budget_min", DEFAULT_TIME_BUDGET_MIN)) * 60
+            except Exception:
+                _budget_sec = DEFAULT_TIME_BUDGET_MIN * 60
+
             for i in range(total_batches):
+                # v3.3: 배치 시작 전 시간 예산 검사
+                if time.time() - _gemini_start_time > _budget_sec:
+                    budget_exceeded = True
+                    early_stop_reason = (
+                        f"시간 예산({_budget_sec // 60}분) 초과 — "
+                        f"{i}/{total_batches} 배치까지만 처리"
+                    )
+                    append_log(f"⏱️ {early_stop_reason}")
+                    for j in range(i, total_batches):
+                        failed_batches.append(j + 1)
+                    break
+
+                # v3.3: 연속 실패 시 조기 중단 (일일 한도 소진 추정)
+                if consecutive_failures >= 2:
+                    early_stop_reason = (
+                        "연속 2개 배치 실패 — API 일일 한도 소진 가능성. "
+                        f"{i}/{total_batches} 배치까지만 처리"
+                    )
+                    append_log(f"🛑 {early_stop_reason}")
+                    for j in range(i, total_batches):
+                        failed_batches.append(j + 1)
+                    break
+
                 status_elem.text(f"🚀 1차 추출 [{i+1}/{total_batches}]")
                 batch = extracted_data[i*batch_size:(i+1)*batch_size]
                 bt = "\n\n".join([
@@ -2398,14 +2813,22 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
                     model = ret_model
                     append_log(f"모델 영구 교체됨: → {final_model}")
 
+                batch_ok = False
                 if res is not None:
                     try:
                         if res.text and len(res.text.strip()) > 10:
                             intermediate.append(res.text)
+                            batch_ok = True
                     except (ValueError, AttributeError):
                         append_log(f"배치 {i+1}: 응답 텍스트 접근 실패 (safety filter?)")
                 else:
                     append_log(f"배치 {i+1} 실패 (5회 재시도 소진)")
+
+                if batch_ok:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    failed_batches.append(i + 1)
 
                 # v2.4: 호출 간격 사용자 설정
                 if i < total_batches-1:
@@ -2415,15 +2838,31 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
 
             if not intermediate:
                 elapsed = int(time.time() - _gemini_start_time)
+                _extra = f"\n\n**중단 사유:** {early_stop_reason}" if early_stop_reason else ""
                 st.error(
-                    f"❌ **{elapsed//60}분 동안 시도했으나 결과를 받지 못했습니다.**\n\n"
+                    f"❌ **{elapsed//60}분 동안 시도했으나 결과를 받지 못했습니다.**{_extra}\n\n"
                     f"**해결 방법:**\n"
-                    f"- 다른 모델 선택 (Flash가 가장 한도 여유 있음)\n"
                     f"- 호출 간격을 더 길게 (사이드바 슬라이더)\n"
+                    f"- 분석 시간 예산을 늘리기 (사이드바)\n"
                     f"- 새 키 발급 후 재시도\n"
+                    f"- 문서 수를 줄여서 재시도\n"
                     f"- NotebookLM(아래 섹션)을 대안으로 사용"
                 )
                 return False
+
+            # v3.3: 부분 실패를 조용히 넘기지 않고 사용자에게 명시
+            if failed_batches:
+                _ok = total_batches - len(failed_batches)
+                st.warning(
+                    f"⚠️ **전체 {total_batches}개 배치 중 {len(failed_batches)}개가 처리되지 않았습니다.** "
+                    f"({_ok}개 배치의 문서만 분석에 반영됨)\n\n"
+                    + (f"사유: {early_stop_reason}\n\n" if early_stop_reason else "")
+                    + "결과에 일부 문서가 누락되어 있으니 참고하세요."
+                )
+                append_log(
+                    f"부분 실패: 배치 {failed_batches} 미반영 "
+                    f"({_ok}/{total_batches} 성공)"
+                )
 
             status_elem.text("🧠 최종 병합 분석 중...")
             fi = "\n\n=== 배치 구분 ===\n\n".join(intermediate)
@@ -2483,10 +2922,23 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
 
         status_elem.text("✅ AI 분석 완료! 결과 문서를 생성하고 있습니다...")
 
-        cited_docs = set(re.findall(r'[A-Z]\d?-\d{7}', result_text))
+        cited_docs = extract_doc_ids(result_text)
         hallucinated = cited_docs - valid_doc_ids
         if hallucinated:
             result_text += f"\n\n---\n⚠️ **검증 경고:** 다음 문서 번호는 다운로드된 파일 목록에 없습니다 (할루시네이션 가능성): {', '.join(sorted(hallucinated))}"
+
+        # v3.3: 부분 실패가 있었다면 결과 문서 최상단에도 명시
+        try:
+            if failed_batches:
+                _ok = total_batches - len(failed_batches)
+                result_text = (
+                    f"> ⚠️ **주의:** 전체 {total_batches}개 배치 중 {_ok}개만 분석에 반영되었습니다. "
+                    f"일부 문서가 누락된 결과입니다."
+                    + (f" (사유: {early_stop_reason})" if early_stop_reason else "")
+                    + "\n\n" + result_text
+                )
+        except NameError:
+            pass  # Direct 분석 경로에서는 failed_batches가 없음
 
         doc = Document()
         doc.add_heading(f"AI 정밀 분석 요약 ({final_model})", 0)
@@ -2550,7 +3002,7 @@ def _parse_ai_summary_into_proposals(ai_summary_text):
         lines = part.split('\n', 1)
         header = lines[0].strip()
         body = lines[1].strip() if len(lines) > 1 else ""
-        doc_ids = set(re.findall(r'[A-Z]\d?-\d{7}', part))
+        doc_ids = extract_doc_ids(part)
         proposals.append({
             "header": header,
             "body": body,
@@ -2730,6 +3182,8 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key,
         if not result or len(result.strip()) < 50:
             return False, "AI 응답이 너무 짧습니다."
 
+        # v3.2: 어떤 모델로 분석했는지 결과 하단에 명시
+        result = f"{result}\n\n---\n*분석 모델: `{display_or_err}`*"
         return True, result
 
     except Exception as e:
@@ -2760,6 +3214,18 @@ with st.sidebar.expander("⚙️ Gemini API 고급 설정", expanded=False):
         help="짧게 = 빠르지만 한도 초과 위험. 길게 = 안전하지만 느림. Flash는 8초, Pro는 15초 권장."
     )
     st.caption(f"현재: {st.session_state.ai_call_interval}초")
+
+    # v3.3: 분석 시간 예산
+    st.slider(
+        "분석 시간 예산 (분)",
+        min_value=5, max_value=50,
+        key="ai_time_budget_min",
+        help="이 시간을 넘기면 남은 배치를 중단하고 그때까지 모은 결과로 분석을 마칩니다."
+    )
+    st.caption(
+        f"현재: {st.session_state.ai_time_budget_min}분 — "
+        f"Cloud Run 등 배포 환경의 요청 타임아웃보다 짧게 설정하세요."
+    )
 
 page = st.sidebar.radio("메뉴", ["🚀 통합 분석기", "⚙️ 설정", "ℹ️ 가이드"])
 
@@ -2801,7 +3267,7 @@ elif page == "ℹ️ 가이드":
     """)
 
     st.markdown("---")
-    st.header("📊 모델 선택 가이드 (v3.1)")
+    st.header("📊 모델 선택 가이드 (v3.3)")
     st.markdown("""
 **🟢 Flash 자동 (권장):**
 - 분당 10회, 일 250회까지 무료
@@ -2823,8 +3289,8 @@ elif page == "🚀 통합 분석기":
     st.caption("Output 1·2는 기본 | Output 3 Gemini는 선택")
 
     st.caption(
-        "v3.1 — 쟁점별로 찬성·반대 회사를 나눠서 표시  \n"
-        "· 최신 Flash 자동 선택 (무료 티어 전용, 요금 청구 없음)  \n"
+        "v3.3 — 쟁점별로 찬성·반대 회사를 나눠서 표시  \n"
+        "· 3GPP 공식 서버만 접속, 파일 크기·분석 시간 상한 적용  \n"
         "· 임시파일 자동 정리로 메모리 사용량 감소"
     )
 
@@ -2905,17 +3371,42 @@ elif page == "🚀 통합 분석기":
     elif input_method == "Excel 파일 업로드":
         uploaded = st.file_uploader("엑셀(.xlsx) — 1열: 문서번호(하이퍼링크), 3열: 회사명", type=["xlsx","xls"])
         if uploaded:
-            entries = read_excel_from_bytes(uploaded)
+            entries, skipped = read_excel_from_bytes(uploaded)
             st.info(f"총 {len(entries)}개 문서 인식")
+            # v3.3: 제외된 행을 사용자에게 명시 (조용히 누락되지 않도록)
+            if skipped:
+                with st.expander(f"⚠️ 제외된 행 {len(skipped)}개 — 사유 확인", expanded=False):
+                    for _d, _why in skipped[:50]:
+                        st.text(f"  {_d}  —  {_why}")
+                    if len(skipped) > 50:
+                        st.caption(f"  ... 외 {len(skipped)-50}개")
+                    st.caption(
+                        "하이퍼링크가 없는 행은 문서 경로를 확정할 수 없어 제외됩니다. "
+                        "'🔍 회의 번호로 자동 조회' 방식을 이용하시면 자동으로 경로가 채워집니다."
+                    )
     else:
         raw = st.text_area("3GPP .zip 링크를 한 줄에 하나씩:", height=120)
         if raw:
+            rejected = []
             for line in raw.strip().split("\n"):
                 url = line.strip()
-                if url:
-                    docid = url.split("/")[-1].replace(".zip","")
-                    entries.append({"doc": docid, "company": "Unknown", "link": url})
+                if not url:
+                    continue
+                # v3.3: 3gpp.org 외 도메인 차단
+                if not _is_allowed_doc_url(url):
+                    rejected.append(url)
+                    continue
+                docid = url.split("/")[-1].replace(".zip","")
+                entries.append({"doc": docid, "company": "Unknown", "link": url})
             st.info(f"총 {len(entries)}개 문서 인식")
+            if rejected:
+                st.error(
+                    f"❌ 허용되지 않은 도메인 {len(rejected)}개 제외 — "
+                    f"3gpp.org 도메인만 다운로드할 수 있습니다."
+                )
+                with st.expander("제외된 링크 보기", expanded=False):
+                    for _u in rejected[:20]:
+                        st.text(f"  {_u[:100]}")
 
     # Step 2: 기본 분석
     st.markdown("---")
@@ -3118,6 +3609,25 @@ elif page == "🚀 통합 분석기":
                     )
                     if preview_target:
                         st.success(f"✅ 선택된 모델: **{preview_display}**")
+                        # v3.2: 왜 이 모델이 뽑혔는지 확인할 수 있도록 후보 목록 제공
+                        try:
+                            _cands = _list_selectable_models(_get_cached_models(api_key_to_use))
+                            _cands = sorted(_cands, key=_flash_version_key, reverse=True)
+                            if len(_cands) > 1:
+                                with st.expander(
+                                    f"🔍 사용 가능한 Flash 모델 {len(_cands)}개 — 선택 근거 확인",
+                                    expanded=False
+                                ):
+                                    st.caption(
+                                        "버전이 가장 높은 모델을 자동 선택합니다. "
+                                        "(같은 버전이면 Lite보다 일반 Flash 우선)"
+                                    )
+                                    for _m in _cands:
+                                        _n = _model_short_name(_m)
+                                        _mark = "**← 선택됨**" if _m == preview_target else ""
+                                        st.markdown(f"- `{_n}` {_mark}")
+                        except Exception:
+                            pass
                     else:
                         st.warning(f"⚠️ {preview_display}")
                 except Exception:
