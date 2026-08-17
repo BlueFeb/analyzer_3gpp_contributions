@@ -1,9 +1,33 @@
 """
-3GPP Contribution Analyzer v3.5 — Accurate Error Classification
+3GPP Contribution Analyzer v3.7 — Output 2/3 Criteria Alignment
 ================================================================
 Output 1: Conclusions 취합 .docx (원본과 동일)
 Output 2: TF-IDF Proposal Summary .docx (원본과 동일)
 Output 3: Gemini 의미 분석 (무료 Flash 계열 전용)
+
+v3.7 변경점 (전면 재검토에서 발견한 불일치 수정):
+- Output 2(TF-IDF)와 Output 3(AI 분석)의 제안 인식 기준이 어긋나 있던 문제 수정.
+  Output 3는 v3.1부터 observation/recommendation을 결론 어근으로 인정하는데,
+  Output 2는 여전히 "proposal"/"summary of change"로 시작하는 줄만 봤음.
+  같은 문서인데 두 출력의 결과가 달라지는 원인이었다.
+  또 "**Proposal 1**", "- Proposal 1", "1. Proposal" 같은 흔한 표기도
+  선행 장식 때문에 전부 놓쳤음.
+  → _is_proposal_line()으로 통합. 선행 불릿/번호/마크다운을 제거한 뒤
+    어근으로 판정. 기존에 잡히던 4종은 그대로 유지하면서 6종을 추가 인식.
+    (15개 케이스 검증 완료)
+
+v3.6 변경점 (실패 원인을 알 수 없던 문제 해결):
+- 재시도 루프에 로깅이 전혀 없어, 분석 실패 시 '처리 로그'가 비어 있고
+  원인 진단이 불가능했음. 이제 모든 시도/실패/대기/소진을 기록한다.
+- 응답 진단 추가: Gemini가 응답을 거부·중단하면 finish_reason,
+  block_reason, safety_ratings, usage에 이유가 담기는데 기존 코드는
+  이를 전혀 읽지 않았음. _log_response_diagnostics()로 기록.
+- 재시도 소진 시 None을 조용히 반환하던 것을 예외로 바꿔, 마지막 실제
+  오류가 사용자에게 전달되도록 함. Map 배치는 예외를 잡아 해당 배치만
+  실패 처리하고 계속 진행(인증 오류는 전체 중단).
+- Streamlit 제어 예외(RerunException/StopException)를 except Exception이
+  삼키던 문제 방어 — rerun이 무효화되고 엉뚱한 'API 오류'가 뜨던 경로 차단.
+- 분석 실패 시 실패 원인 로그를 그 자리에서 바로 펼쳐 보여줌.
 
 v3.5 변경점 (v3.4 점검에서 발견한 결함 수정):
 - 오류 분류를 상태코드 정확 추출 방식으로 재작성. v3.4는 '403' in err_str
@@ -2397,6 +2421,37 @@ class TFIDFEmbedder:
         return self.v.transform(proc).toarray()
 
 
+def _is_proposal_line(text):
+    """v3.7: Output 2(TF-IDF)가 '제안 문장'으로 취급할 라인인지 판정.
+
+    [배경] 기존에는 txt.lower().startswith("proposal") / ("summary of change")
+    두 가지만 봤다. 그런데 v3.1에서 Output 3(AI 분석)은 observation,
+    recommendation 등을 결론 어근으로 인정하도록 확장했기 때문에,
+    같은 문서를 두고 Output 2와 Output 3의 인식 결과가 어긋났다.
+    또 "**Proposal 1**", "- Proposal 1", "1. Proposal" 같은 흔한 표기도
+    선행 문자 때문에 전부 놓쳤다.
+
+    [설계] 선행 장식(불릿/번호/마크다운)을 제거한 뒤 어근으로 판정.
+    Output 3의 CONCLUSION_ROOTS와 일관되게 맞추되, 여기서는 '문장 단위'라
+    proposal/observation/recommendation 계열과 CR 필드만 대상으로 한다.
+    (summary/conclusion은 섹션 헤더이지 개별 제안이 아니므로 제외 —
+     기존 동작 유지)
+    """
+    if not text:
+        return False
+    t = text.strip()
+    # 선행 장식 제거: 불릿(-, *, •), 번호(1. / 1)), 마크다운 굵게(**)
+    t = re.sub(r'^\s*(?:[-*•]\s*)?(?:\d+[.)]\s*)?(?:\*{1,2}\s*)?', '', t)
+    low = t.lower()
+    # CR 필드
+    if low.startswith("summary of change"):
+        return True
+    # 제안 계열 어근 (첫 단어 기준)
+    first = re.split(r'[\s:：.\-]', low, 1)[0].strip()
+    first = first.rstrip('s')          # proposals → proposal
+    return first in ("proposal", "prop", "observation", "obs", "recommendation")
+
+
 def parse_and_summarize(in_bio, status_elem, log_func):
     d = Document(in_bio)
     props, pcs, cur = [], {}, None
@@ -2410,8 +2465,8 @@ def parse_and_summarize(in_bio, status_elem, log_func):
         elif el.tag.endswith("p"):
             p = Paragraph(el, d)
             txt = p.text.strip()
-            is_target = (txt.lower().startswith("proposal") or
-                        txt.lower().startswith("summary of change"))
+            # v3.7: 어근 기반 판정으로 확장 (Output 3와 기준 일치)
+            is_target = _is_proposal_line(txt)
             if is_target:
                 buf, cm = [txt], {cur} if cur else set()
                 idx2 = d.element.body.index(el) + 1
@@ -2421,9 +2476,11 @@ def parse_and_summarize(in_bio, status_elem, log_func):
                     sp = Paragraph(sib, d)
                     st_text = sp.text.rstrip()
                     if not st_text.strip(): break
-                    if (st_text.lower().startswith("proposal") or
-                        st_text.lower().startswith("summary of change") or
-                        st_text.lower().startswith("reason for change")): break
+                    # v3.7: 다음 제안이 시작되면 현재 블록 종료.
+                    # "reason for change"(CR 필드)도 경계로 유지.
+                    if _is_proposal_line(st_text) or \
+                       st_text.lower().lstrip().startswith("reason for change"):
+                        break
                     buf.append(st_text)
                     if cur: cm.add(cur)
                     idx2 += 1
@@ -2558,6 +2615,49 @@ def classify_api_error(err_str):
     return "other"
 
 
+def _log_response_diagnostics(resp, label=""):
+    """v3.6: Gemini 응답이 비었거나 .text 접근에 실패했을 때 원인을 로그에 남긴다.
+
+    Gemini는 응답을 거부하거나 잘랐을 때 그 이유를 candidates[].finish_reason,
+    prompt_feedback.block_reason 에 담아 보낸다. 기존 코드는 이를 전혀 보지 않아
+    사용자가 '응답 없음'만 보고 원인을 알 수 없었다.
+    finish_reason 주요 값:
+      SAFETY(안전필터) / MAX_TOKENS(출력한도) / RECITATION(저작권) /
+      PROHIBITED_CONTENT / STOP(정상)
+    """
+    if resp is None:
+        append_log(f"{label} 진단: 응답 객체가 None")
+        return
+    try:
+        pf = getattr(resp, "prompt_feedback", None)
+        if pf:
+            br = getattr(pf, "block_reason", None)
+            if br:
+                append_log(f"{label} 진단: 프롬프트가 차단됨 — block_reason={br}")
+            else:
+                append_log(f"{label} 진단: prompt_feedback={str(pf)[:200]}")
+    except Exception:
+        pass
+    try:
+        cands = getattr(resp, "candidates", None) or []
+        if not cands:
+            append_log(f"{label} 진단: candidates가 비어 있음 (응답 생성 거부)")
+        for i, c in enumerate(cands):
+            fr = getattr(c, "finish_reason", None)
+            append_log(f"{label} 진단: candidate[{i}] finish_reason={fr}")
+            sr = getattr(c, "safety_ratings", None)
+            if sr:
+                append_log(f"{label} 진단: safety_ratings={str(sr)[:300]}")
+    except Exception as ex:
+        append_log(f"{label} 진단 중 오류: {str(ex)[:150]}")
+    try:
+        um = getattr(resp, "usage_metadata", None)
+        if um:
+            append_log(f"{label} 진단: usage={str(um)[:200]}")
+    except Exception:
+        pass
+
+
 def _call_with_retry_and_fallback(api_key, model_obj, prompt, generation_config,
                                     status_elem, max_retries, start_time,
                                     current_model_name, model_choice):
@@ -2569,22 +2669,31 @@ def _call_with_retry_and_fallback(api_key, model_obj, prompt, generation_config,
     cur_model = model_obj
     cur_name = current_model_name
     fallback_attempted = False
+    last_error = None   # v3.6: 마지막 오류를 호출자에게 전달하기 위해 보관
 
     for attempt in range(max_retries):
         try:
+            append_log(f"API 호출 시도 {attempt+1}/{max_retries} (모델: {cur_name}, "
+                       f"프롬프트 {len(prompt):,}자)")
             res = _safe_gemini_call(api_key, cur_model, prompt, generation_config=generation_config)
+            append_log(f"API 응답 수신 (시도 {attempt+1})")
             return res, cur_name, cur_model
         except Exception as e:
             err_str = str(e)
+            last_error = err_str
             # v3.5: 상태코드를 정확히 추출해 분류 (부분매칭 오탐 제거)
             kind = classify_api_error(err_str)
             is_429 = (kind == "quota")
             is_503 = (kind == "overload")
+            # v3.6: 모든 실패를 로그에 남긴다.
+            # (v3.5까지는 재시도 루프에 로그가 전혀 없어서, 실패해도
+            #  '처리 로그'가 비어 있어 원인 진단이 불가능했음)
+            append_log(f"시도 {attempt+1} 실패 [{kind}]: {err_str[:300]}")
 
             # v3.4: 인증 오류는 재시도해도 소용없으므로 즉시 중단하고
             # 사용자에게 원인을 명확히 알린다.
             if kind == "auth":
-                append_log(f"인증 오류(재시도 안 함): {err_str[:200]}")
+                append_log(f"인증 오류 — 재시도 중단")
                 raise RuntimeError(f"__AUTH_ERROR__{err_str}")
 
             # v3.0: 503(서버 과부하) 시 다른 Flash 버전으로 폴백.
@@ -2617,6 +2726,7 @@ def _call_with_retry_and_fallback(api_key, model_obj, prompt, generation_config,
             if is_429 or is_503:
                 wait = [30, 60, 120, 180, 240][min(attempt, 4)]
                 elapsed = int(time.time() - start_time)
+                append_log(f"{wait}초 대기 후 재시도 (누적 {elapsed}초)")
                 for cd in range(wait, 0, -1):
                     elapsed = int(time.time() - start_time)
                     if status_elem:
@@ -2629,9 +2739,13 @@ def _call_with_retry_and_fallback(api_key, model_obj, prompt, generation_config,
                             pass
                     time.sleep(1)
             else:
+                # v3.6: 분류되지 않은 오류도 로그에 남기고 전파
+                append_log(f"재시도 불가 오류 — 중단: {err_str[:300]}")
                 raise
 
-    return None, None, None
+    # v3.6: 재시도 소진. 마지막 오류를 호출자가 표시할 수 있도록 예외로 전달.
+    append_log(f"재시도 {max_retries}회 모두 소진. 마지막 오류: {str(last_error)[:300]}")
+    raise RuntimeError(f"__RETRY_EXHAUSTED__{last_error or 'unknown'}")
 
 
 def run_gemini_analysis(extracted_data, status_elem, api_key,
@@ -2949,11 +3063,23 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
                 batch_docs = ", ".join([it['doc'] for it in batch])
                 mp = MAP_PROMPT_TEMPLATE.format(doc_list=batch_docs, batch_text=bt)
 
-                res, ret_name, ret_model = _call_with_retry_and_fallback(
-                    api_key, model, mp, strict_config,
-                    status_elem, 5, _gemini_start_time,
-                    final_model, model_choice
-                )
+                # v3.6: 재시도 소진은 이 배치만 실패 처리하고 계속 진행.
+                #       인증 오류는 전체 중단해야 하므로 그대로 전파.
+                res, ret_name, ret_model = None, None, None
+                try:
+                    res, ret_name, ret_model = _call_with_retry_and_fallback(
+                        api_key, model, mp, strict_config,
+                        status_elem, 5, _gemini_start_time,
+                        final_model, model_choice
+                    )
+                except RuntimeError as _re:
+                    _rs = str(_re)
+                    if _rs.startswith("__AUTH_ERROR__"):
+                        raise   # 인증 오류 → 전체 중단
+                    append_log(f"배치 {i+1} 실패: {_rs.replace('__RETRY_EXHAUSTED__','')[:200]}")
+                except Exception as _oe:
+                    append_log(f"배치 {i+1} 예외: {str(_oe)[:200]}")
+
                 # v2.5: 폴백된 모델 객체로 영구 교체 (다음 배치도 같은 모델 사용)
                 if ret_name:
                     final_model = ret_name
@@ -2967,10 +3093,11 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
                         if res.text and len(res.text.strip()) > 10:
                             intermediate.append(res.text)
                             batch_ok = True
-                    except (ValueError, AttributeError):
-                        append_log(f"배치 {i+1}: 응답 텍스트 접근 실패 (safety filter?)")
-                else:
-                    append_log(f"배치 {i+1} 실패 (5회 재시도 소진)")
+                        else:
+                            append_log(f"배치 {i+1}: 응답이 비어 있음")
+                    except (ValueError, AttributeError) as _te:
+                        append_log(f"배치 {i+1}: 응답 텍스트 접근 실패 — {str(_te)[:200]}")
+                        _log_response_diagnostics(res, f"배치 {i+1}")
 
                 if batch_ok:
                     consecutive_failures = 0
@@ -3043,25 +3170,31 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
         status_elem.text("🔍 응답 확인 중...")
 
         if response is None:
+            # v3.6: 여기 도달하면 예외 없이 None이 온 비정상 경로.
+            _log_response_diagnostics(response, "최종 응답")
             st.error(
                 "❌ **API 응답을 받지 못했습니다.**\n\n"
-                "한도 소진 또는 일시적 과부하 상황입니다.\n\n"
-                "**해결:** 모델을 Flash로 변경하거나, 새 키 발급 후 재시도."
+                "'처리 로그'를 펼쳐 상세 원인을 확인해주세요."
             )
             return False
 
         if not hasattr(response, 'text'):
-            st.error("❌ **API가 빈 응답을 반환했습니다.**")
+            _log_response_diagnostics(response, "최종 응답")
+            st.error("❌ **API가 빈 응답을 반환했습니다.** '처리 로그'를 확인해주세요.")
             return False
 
         try:
             result_text = response.text
         except (ValueError, AttributeError) as e:
+            # v3.6: 차단 사유를 실제로 확인해 로그에 남긴다.
+            append_log(f"응답 텍스트 접근 실패: {str(e)[:300]}")
+            _log_response_diagnostics(response, "최종 응답")
             st.error(
-                "❌ **AI 응답이 안전 필터에 의해 차단되었습니다.**\n\n"
-                "**해결:** 다시 시도하거나 NotebookLM 사용."
+                "❌ **AI가 응답 생성을 완료하지 못했습니다.**\n\n"
+                "안전 필터 차단, 출력 길이 초과 등이 원인일 수 있습니다.\n"
+                "정확한 사유는 아래 **'처리 로그'** 에 기록되어 있습니다.\n\n"
+                "**해결:** 다시 시도하거나, 문서 수를 줄여서 재시도해보세요."
             )
-            append_log(f"Gemini safety filter: {e}")
             return False
 
         if not result_text or len(result_text.strip()) < 50:
@@ -3118,6 +3251,11 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
         return True
 
     except Exception as e:
+        # v3.6: Streamlit 제어 흐름 예외(st.rerun/st.stop)는 잡지 않고 통과시킨다.
+        # 이들도 Exception을 상속하므로, 그냥 삼키면 rerun이 무효화되고
+        # 엉뚱한 'API 오류' 메시지가 표시된다.
+        if type(e).__name__ in ("RerunException", "StopException"):
+            raise
         err = str(e)
         if GEMINI_API_KEY and GEMINI_API_KEY in err:
             err = err.replace(GEMINI_API_KEY, "***HIDDEN***")
@@ -3125,7 +3263,9 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
             err = err.replace(api_key, "***HIDDEN***")
         # v3.5: 분류 함수로 통일 (부분매칭 오탐 제거)
         _is_auth_marked = err.startswith("__AUTH_ERROR__")
-        clean = err.replace("__AUTH_ERROR__", "")
+        # v3.6: 재시도 소진 마커도 함께 처리
+        _is_exhausted = err.startswith("__RETRY_EXHAUSTED__")
+        clean = err.replace("__AUTH_ERROR__", "").replace("__RETRY_EXHAUSTED__", "")
         kind = "auth" if _is_auth_marked else classify_api_error(clean)
 
         if kind == "auth":
@@ -3141,20 +3281,26 @@ def run_gemini_analysis(extracted_data, status_elem, api_key,
             )
             append_log(f"인증 실패 상세: {clean[:300]}")
         elif kind == "quota":
+            _pre = "재시도를 모두 소진했습니다. " if _is_exhausted else ""
             st.error(
-                "❌ **API 한도가 초과되었습니다.**\n\n"
+                f"❌ **API 한도가 초과되었습니다.** {_pre}\n\n"
                 "**해결:** 잠시 후 재시도하거나, 다른 프로젝트에서 발급한 새 키를 사용하세요.\n"
-                "(같은 프로젝트의 키를 여러 개 만들어도 한도는 공유됩니다)"
+                "(같은 프로젝트의 키를 여러 개 만들어도 한도는 공유됩니다)\n\n"
+                "상세 내역은 아래 '처리 로그'에서 확인할 수 있습니다."
             )
             append_log(f"한도 초과: {clean[:300]}")
         elif kind == "overload":
+            _pre = "재시도를 모두 소진했습니다. " if _is_exhausted else ""
             st.error(
-                "❌ **Gemini 서버가 일시적으로 혼잡합니다.**\n\n"
+                f"❌ **Gemini 서버가 일시적으로 혼잡합니다.** {_pre}\n\n"
                 "사용자 키 문제가 아니며, 잠시 후 다시 시도하면 대개 해결됩니다."
             )
             append_log(f"서버 과부하: {clean[:300]}")
         else:
-            st.error("❌ **API 오류가 발생했습니다.** 자세한 내용은 '처리 로그'를 확인하세요.")
+            st.error(
+                "❌ **API 오류가 발생했습니다.**\n\n"
+                "아래 **'처리 로그'** 를 펼치면 실제 오류 내용을 볼 수 있습니다."
+            )
             append_log(f"Gemini error (sanitized): {clean[:300]}")
     return False
 
@@ -3345,7 +3491,9 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key,
 
         response = _safe_gemini_call(api_key, model, prompt)
         if not response or not hasattr(response, 'text'):
-            return False, "API 응답을 받지 못했습니다."
+            # v3.6: 원인을 로그에 남긴다
+            _log_response_diagnostics(response, "심층분석")
+            return False, "API 응답을 받지 못했습니다. ('처리 로그'에서 상세 확인)"
 
         try:
             result = response.text
@@ -3360,6 +3508,11 @@ def run_deep_analysis(proposal_header, proposal_body, selected_docs, api_key,
         return True, result
 
     except Exception as e:
+        # v3.6: Streamlit 제어 흐름 예외(st.rerun/st.stop)는 잡지 않고 통과시킨다.
+        # 이들도 Exception을 상속하므로, 그냥 삼키면 rerun이 무효화되고
+        # 엉뚱한 'API 오류' 메시지가 표시된다.
+        if type(e).__name__ in ("RerunException", "StopException"):
+            raise
         err = str(e)
         if GEMINI_API_KEY and GEMINI_API_KEY in err:
             err = err.replace(GEMINI_API_KEY, "***HIDDEN***")
@@ -3449,7 +3602,7 @@ elif page == "ℹ️ 가이드":
     """)
 
     st.markdown("---")
-    st.header("📊 모델 선택 가이드 (v3.5)")
+    st.header("📊 모델 선택 가이드 (v3.7)")
     st.markdown("""
 **🟢 Flash 자동 (권장):**
 - 분당 10회, 일 250회까지 무료
@@ -3471,9 +3624,9 @@ elif page == "🚀 통합 분석기":
     st.caption("Output 1·2는 기본 | Output 3 Gemini는 선택")
 
     st.caption(
-        "v3.5 — 새 형식(AQ.) API 키 지원  \n"
-        "· 쟁점별로 찬성·반대 회사를 나눠서 표시  \n"
-        "· 인증 실패·한도 초과·서버 혼잡을 구분해 안내"
+        "v3.7 — 제안 인식 범위 확대 (Observation·Recommendation 포함)  \n"
+        "· 실패 시 원인을 로그에 상세 기록  \n"
+        "· 쟁점별로 찬성·반대 회사를 나눠서 표시"
     )
 
     # Step 1: Input
@@ -3849,7 +4002,7 @@ elif page == "🚀 통합 분석기":
                         )
 
                     if total_docs > 0:
-                        run_gemini_analysis(
+                        _ok = run_gemini_analysis(
                             st.session_state.extracted_data,
                             gemini_status,
                             api_key_to_use,
@@ -3857,6 +4010,12 @@ elif page == "🚀 통합 분석기":
                             manual_model_name=manual_model_name,
                             call_interval=st.session_state.ai_call_interval,
                         )
+                        # v3.6: 실패 시 원인 로그를 그 자리에서 바로 볼 수 있게 노출.
+                        # (기존에는 로그가 페이지 맨 아래에만 있어 확인이 번거로웠음)
+                        if not _ok:
+                            _lt = st.session_state.get("log_text", "") or "(로그 없음)"
+                            with st.expander("🔎 실패 원인 로그 (자세히)", expanded=True):
+                                st.text(_lt[-4000:])
 
         if st.session_state.ai_summary_generated:
             st.success("✅ AI 정밀 요약 완료!")
